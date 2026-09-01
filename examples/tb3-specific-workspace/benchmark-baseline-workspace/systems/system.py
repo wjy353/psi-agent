@@ -57,6 +57,9 @@ async def system_prompt_builder() -> str:
 - background_list: list registered background processes and their alive status
 - fetch: retrieve a URL and return its main article content as Markdown (binary refused; output capped)
 - read_pdf: extract text from PDF files (pdftotext/pymupdf/pdfplumber; force_ocr=True for scanned PDFs via tesseract)
+- diff: show a unified diff between a file and another file or inline expected content
+- artifact_validate: run a generic acceptance checklist
+  (exists/non-empty/contains/not_contains/exact_match/regex/size) on a file or directory
 
 ## Skills
 Location: {skills_dir}

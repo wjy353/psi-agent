@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import glob
 import shutil
+import sys
 import tempfile
 
 import anyio
@@ -102,13 +103,16 @@ async def _try_pdftotext(bash: str, pdf_path: str, max_pages: int) -> str | None
 
 
 async def _try_pymupdf(bash: str, pdf_path: str, max_pages: int) -> str | None:
-    script = f"""python3 -c "
+    # Use the current (venv) interpreter, not system python3; forward slashes avoid bash eating backslashes
+    python = sys.executable.replace("\\", "/")
+    pdf = pdf_path.replace("\\", "/")
+    script = f"""{python} -c "
 import sys
 try:
     import fitz
 except ImportError:
     sys.exit(1)
-doc = fitz.open('{pdf_path}')
+doc = fitz.open('{pdf}')
 pages = []
 for i, page in enumerate(doc):
     if i >= {max_pages}:
@@ -134,14 +138,16 @@ print(chr(10).join(pages))
 
 
 async def _try_pdfplumber(bash: str, pdf_path: str, max_pages: int) -> str | None:
-    script = f"""python3 -c "
+    python = sys.executable.replace("\\", "/")
+    pdf = pdf_path.replace("\\", "/")
+    script = f"""{python} -c "
 import sys
 try:
     import pdfplumber
 except ImportError:
     sys.exit(1)
 pages = []
-with pdfplumber.open('{pdf_path}') as pdf:
+with pdfplumber.open('{pdf}') as pdf:
     for i, page in enumerate(pdf.pages):
         if i >= {max_pages}:
             break

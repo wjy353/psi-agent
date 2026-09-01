@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import AsyncIterator
 from typing import Any, cast
 
@@ -43,7 +44,7 @@ _MESSAGE_REASONING_FIELDS = ("reasoning_content", "reasoning", "thinking")
 # 是 ``any-llm-sdk>=1.21.0``, 所以是一次静默的上游行为变更改掉了我们的线上语义。
 #
 # 只在调用方**没给**时兜底, 给了就用它的 —— 这里是转发层, 不该覆盖上游意图。
-_DEFAULT_REASONING_EFFORT = "medium"
+_DEFAULT_REASONING_EFFORT = os.environ.get("PSI_AI_REASONING_EFFORT", "medium")
 
 
 def _describe_delta(data: str) -> str:

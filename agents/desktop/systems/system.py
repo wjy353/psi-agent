@@ -805,7 +805,7 @@ def _build_datetime_section() -> str:
     tz_name = os.environ.get("TZ", "").strip()
     try:
         now = datetime.now(ZoneInfo(tz_name)) if tz_name else datetime.now().astimezone()
-    except ZoneInfoNotFoundError, ValueError:
+    except (ZoneInfoNotFoundError, ValueError):
         # Unknown tz name: fall back to system local time and label it
         # honestly so the agent knows the zone is unverified.
         now = datetime.now().astimezone()
@@ -966,7 +966,7 @@ async def _run_self_evolution_review(
                 else:
                     try:
                         args = json.loads(args_raw)
-                    except TypeError, json.JSONDecodeError:
+                    except (TypeError, json.JSONDecodeError):
                         args = {}
                     try:
                         result = await executor(**args)
@@ -1499,17 +1499,19 @@ async def system_before_turn(
 
 
 _SAVING_GATE_SECTION = """\
-## Saving-decision core rules
+## Saving-decision gate
 For purchase / money-saving requests (national subsidy, coupons, price comparison, bank instant discounts,
-recommendations, cart-filling), these core rules ALWAYS apply:
-1. Policy parameters (rate / cap / threshold / energy-efficiency / categories) come ONLY from this session's
-   retrieval or a fact-card snapshot (with verification date) - never from memory, never by reverse-engineering
-   from product price.
-2. Computing money (subsidy / final price): call subsidy_calc when available; if unavailable or failed, mark
-   [Unverified] - do NOT hand-compute.
-3. Recommendation / guide tasks: first call review_search for candidate articles; only if it returns empty or
-   fails may you search on your own.
-4. Also load and follow `skills/saving-decision/SKILL.md` (read it with the read tool) for the full rule set.
+recommendations, cart-filling), handle in this order - each step is MUST:
+Step 0. BEFORE answering, first read `skills/saving-decision/SKILL.md` (with the read tool) and follow it;
+        re-read it whenever a new saving question starts.
+Step 1. Policy parameters (rate / cap / threshold / energy-efficiency / categories) come ONLY from this
+        session's retrieval or a fact-card snapshot (with verification date) - never from memory.
+Step 2. Computing money (subsidy / final price): call subsidy_calc when available; if unavailable or failed,
+        mark [Unverified] - do NOT hand-compute.
+Step 3. Recommendation / guide tasks: first call review_search for candidate articles; verify prices on official
+        platforms (JD / Tmall); if info is insufficient, FIRST give 2-3 tiered recommendations, then ask <=2
+        narrowing questions - never ask first without recommending.
+Step 4. Follow the full rule set of the skill loaded in Step 0 (constraints / strategy / output / tags).
 Ignore this section for non-saving tasks.
 """
 

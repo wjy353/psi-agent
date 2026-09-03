@@ -163,6 +163,9 @@ async def policy_query(subject: str = "", region: str = "", return_json: bool = 
             "返回 2026 现行口径，非实时检索；应标注「以官方/省级官方文件为准」。"
             "政策时效至 expires_at（2026-12-31），超过该日期须检索最新官方文件，不得沿用本快照。"
             "若 region 为省份，可以该省商务厅细则为准；以下单结算页显示为准。"
+            "【内部字段净化】fact_card_version / verified_at / expires_at / 口径标签 仅用于判断时效，"
+            "禁止原样出现在给用户的回答里；引用来源用用户语言：官方文件名 + 查询日期 YYYY-MM-DD，"
+            "不得出现 事实卡 / 口径卡 / guobu-v1.0 / 快照 / verified_at / expires_at 等内部词。"
         ),
     }
     return json.dumps(result, ensure_ascii=False) if return_json else str(result)

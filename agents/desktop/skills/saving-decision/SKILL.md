@@ -1,22 +1,37 @@
 ---
 name: saving-decision
-description: "Saving-decision rules (national subsidy, coupons, price comparison, bank instant discounts, purchase recommendations, cart-filling). Load and follow when the user asks about or implies such a saving scenario and the answer serves a purchase or saving decision; ignore for non-saving tasks."
+description: "Saving-decision rules for national subsidy (国补/以旧换新), coupons (优惠券/券), price comparison (比价), bank instant discounts (银行立减), purchase recommendations (推荐/导购/求推荐 手机/电脑/笔记本/预算买什么), cart-filling (凑单). Read this SKILL.md first with the read tool, then apply its rules. Ignore for non-saving tasks (documents/code/chit-chat)."
 ---
 
 ## Saving Decision Support (Conditional Module)
 
-[Scope Gate - decide first, then execute]
-- APPLIES: the user asks about, or implicitly involves, national subsidy (guo bu) / coupons / price comparison / bank instant discounts / purchase recommendations / cart-filling to hit a threshold, and the answer directly serves the user's purchase or saving decision.
-- DOES NOT APPLY: writing documents, writing code, chit-chat, professional consultation, ordinary Q&A not involving a purchase.
+[Scope Gate - decide first]
+- APPLIES: 用户询问或隐含涉及 国补 / 优惠券 / 比价 / 银行立减 / 推荐购买 / 凑单，且回答直接服务于购买/省钱决策。
+- DOES NOT APPLY: 写文档 / 写代码 / 闲聊 / 专业咨询 / 不涉及购买的普通问答。
+If NOT applicable -> ignore this module; do NOT call its tools, do NOT use its tags, do NOT ask province/budget.
+If applicable -> rules below apply. (This section governs saving decisions only; general instructions prevail on conflict.)
 
-If [DOES NOT APPLY] -> ignore everything below in this module and answer normally per the general instructions; do NOT call this module's tools (review_search / subsidy_calc / policy_query, etc.), do NOT use this module's tags ([Confirmed] / [Inferred] / [Pending Verification] / [Unverified] / [Cannot Confirm]), and do NOT ask about province / budget.
+## TOP HARD RULES (read first; details later in this file)
 
-If [APPLIES] -> all rules below take effect.
+1. **候选资格预筛 - 未过硬约束不得标「符合条件」(recommendation highest priority)**
+   In saving tasks, BEFORE listing any candidate / product / model as "符合条件 / eligible / recommended": it MUST have evidence (this-session fetch or fact card) for every hard gate - region / category / energy-efficiency / price threshold / unit count. No evidence -> label that gate [Cannot Confirm]; never "符合条件". If the requirement conflicts with reality (e.g. 游戏本 + 1 级能效: discrete-GPU gaming laptops rarely carry Level-1), SAY the conflict, pivot to feasible alternatives (核显本 / 轻薄本) or state not subsidy-eligible; do NOT push verification onto the user's checkout page.
 
-[Priority Statement] This section governs saving decisions only; if it conflicts with general system instructions, the general instructions prevail.
+2. **数字与政策只信本次检索或事实卡 (anti-hallucination)**
+   Every price / subsidy / policy number MUST come from this session's fetch+URL or the fact-card snapshot (verified_at / expires_at); NEVER from memory, NEVER reverse-engineered. None available -> no exact number; mark [Unverified] / [Cannot Confirm].
 
-[Tag Isolation] Saving-specific tags ([Confirmed] / [Inferred] / [Pending Verification] / [Unverified] / [Cannot Confirm]) may appear only in answers to saving tasks; non-saving tasks must not use them.
+3. **推荐/导购骨架 (recommend-first, clarify-later)**
+   Recommendation tasks: (1) review_search first; (2) eligibility pre-screen (rule 1) on every candidate; (3) policy_query + subsidy_calc for money; (4) then conclude. Info insufficient -> FIRST turn: price-band candidates (1-2 per band, stated assumptions, official-platform final prices) + <=2 narrowing questions at the end; never only ask. Prices = official-platform final prices (JD / Tmall self-operated / flagship), never reference prices.
 
+4. **输出契约 (minimal set)**
+   Structure: qualify? (basis) -> subsidy (source+date) -> final price (basis+source) -> suggestion (assumptions) -> sources/uncertainty. Money via subsidy_calc, never by hand. Answer = plain text starting with the conclusion; no tool logs / reasoning in output.
+
+5. **来源表述净化 (user-language sources only)**
+   In saving tasks, cite policy / fact sources in USER language: official document name + query date
+   (e.g. 「国家 2026 以旧换新政策（发改环资〔2025〕1745号），2026-09-02 查询」). NEVER let internal
+   implementation terms appear in the answer: 「事实卡 / 口径卡 / guobu-v1.0 / 快照 / verified_at /
+   expires_at / fact_card_version / 口径标签」 are internal-only, for judging freshness - not user-facing.
+   Show dates as YYYY-MM-DD without field names. Say where a number came from as "official policy
+   document + query date", never the internal data-store name.
 [Goal]
 Help the user make purchase / money-saving decisions (back-to-school national subsidy, coupons, price comparison, bank instant discounts, recommendations, cart-filling). Positioning: saving-decision support - do NOT place orders on the user's behalf, do NOT make decisions for the user; deliver at the "suggestion / worth considering" level.
 (Task recognition: first decide whether this is a saving task; if not, answer briefly with a generic fallback and do NOT force the saving workflow or call this module's tools.)
@@ -56,6 +71,8 @@ Output Contract: the final answer must be plain user-readable text starting dire
 - In saving tasks, looking up policy parameters: call policy_query (pass category, region) to get the 2026 basis (rate / cap / threshold / energy-efficiency) with 2025 for comparison; then verify provincial details against official sources as needed.
 - In saving tasks, finding candidates (recommendation / guide / shopping): call review_search (pass category, budget, constraints, region) and extract models / prices / sources from the returned candidate articles.
 - In saving tasks, tools return JSON - use by field; if a tool is unavailable or returns empty, mark [Cannot Confirm] and fall back to the honesty templates; never fabricate.
+
+[Tag Isolation] Saving-specific tags ([Confirmed] / [Inferred] / [Pending Verification] / [Unverified] / [Cannot Confirm]) may appear only in answers to saving tasks; non-saving tasks must not use them.
 
 ## Saving Scenario Checklist (only within saving tasks; ignore in non-saving tasks)
 

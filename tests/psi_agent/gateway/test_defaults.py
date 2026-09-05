@@ -6,15 +6,19 @@ import anyio
 import pytest
 
 from psi_agent.gateway._defaults import (
+    DEFAULT_AGENT_REPO_CANDIDATE,
+    DEFAULT_AGENT_SHORT_NAME_ROOT,
     DEFAULT_USER_WORKSPACE_NAME,
     appdata_history_path,
     ensure_workspace_dir,
+    read_install_language,
     resolve_appdata_root,
     resolve_default_agent,
+    resolve_default_language,
     resolve_default_workspace,
     resolve_history_read_path,
 )
-from psi_agent.gateway._session_manager import SessionInfo
+from psi_agent.runtime._session_manager import SessionInfo
 
 
 @pytest.mark.anyio
@@ -31,8 +35,9 @@ async def test_resolve_default_workspace_soft_desktop_announces_without_mkdir(
 ) -> None:
     desktop = tmp_path / "Desktop"
     await anyio.Path(desktop).mkdir()
+    # Desktop path math moved to the neutral module; brand name stays in _defaults.
     monkeypatch.setattr(
-        "psi_agent.gateway._defaults.platformdirs.user_desktop_dir",
+        "psi_agent._workspace_paths.platformdirs.user_desktop_dir",
         lambda: str(desktop),
     )
     expected = desktop / DEFAULT_USER_WORKSPACE_NAME
@@ -52,14 +57,38 @@ async def test_ensure_workspace_dir_creates(tmp_path: Path) -> None:
 @pytest.mark.anyio
 async def test_resolve_default_agent_soft_haitun_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(tmp_path)
-    agent = tmp_path / "examples" / "haitun-workspace"
+    agent = tmp_path / "agents" / "feishu"
     await anyio.Path(agent).mkdir(parents=True)
     assert await resolve_default_agent("") == str(await anyio.Path(agent).resolve())
 
 
 @pytest.mark.anyio
+async def test_resolve_default_agent_short_name_under_agents(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``--default-agent desktop`` selects ``agents/desktop``, not ``./desktop``."""
+    monkeypatch.chdir(tmp_path)
+    agent = tmp_path / "agents" / "desktop"
+    await anyio.Path(agent).mkdir(parents=True)
+    assert await resolve_default_agent("desktop") == str(await anyio.Path(agent).resolve())
+
+
+@pytest.mark.anyio
+async def test_resolve_default_agent_unknown_short_name_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Was the silent bug: an unknown value used to resolve to ``{cwd}/{value}``."""
+    monkeypatch.chdir(tmp_path)
+    await anyio.Path(tmp_path / "agents" / "feishu").mkdir(parents=True)
+    with pytest.raises(FileNotFoundError, match="feishu"):
+        await resolve_default_agent("desktop")
+
+
+@pytest.mark.anyio
+async def test_short_name_root_matches_repo_candidate_parent() -> None:
+    """The two constants must agree, or soft default and short names diverge."""
+    assert DEFAULT_AGENT_REPO_CANDIDATE.startswith(f"{DEFAULT_AGENT_SHORT_NAME_ROOT}/")
+
+
+@pytest.mark.anyio
 async def test_resolve_default_agent_soft_install_layout_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Inno {app} layout: tools/ + skills/ live at cwd (no examples/ nesting)."""
+    """Inno {app} layout: tools/ + skills/ live at cwd (no workspace/ nesting)."""
     monkeypatch.chdir(tmp_path)
     await anyio.Path(tmp_path / "tools").mkdir()
     await anyio.Path(tmp_path / "skills").mkdir()
@@ -70,11 +99,11 @@ async def test_resolve_default_agent_soft_install_layout_cwd(tmp_path: Path, mon
 async def test_resolve_default_agent_repo_layout_wins_over_cwd_tools(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Repo root may have unrelated tools/; prefer examples/haitun-workspace."""
+    """Repo root may have unrelated tools/; prefer agents/feishu."""
     monkeypatch.chdir(tmp_path)
     await anyio.Path(tmp_path / "tools").mkdir()
     await anyio.Path(tmp_path / "skills").mkdir()
-    agent = tmp_path / "examples" / "haitun-workspace"
+    agent = tmp_path / "agents" / "feishu"
     await anyio.Path(agent).mkdir(parents=True)
     assert await resolve_default_agent("") == str(await anyio.Path(agent).resolve())
 
@@ -151,3 +180,69 @@ def test_session_info_includes_agent_field() -> None:
     )
     assert info.agent == "/agent"
     assert info.ai_id == "ai-1"
+
+
+@pytest.mark.anyio
+async def test_resolve_default_language_explicit_wins(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("HAITUN_LANG", raising=False)
+    assert await resolve_default_language("en_US") == "en-US"
+    assert await resolve_default_language("zh") == "zh-CN"
+
+
+@pytest.mark.anyio
+async def test_resolve_default_language_env_wins(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HAITUN_LANG", "en-US")
+    assert await resolve_default_language() == "en-US"
+
+
+@pytest.mark.anyio
+async def test_resolve_default_language_reads_install_file(tmp_path: Path) -> None:
+    hint = tmp_path / "agent"
+    await anyio.Path(hint).mkdir()
+    await (anyio.Path(hint) / "haitun-language.txt").write_text("en-US\n", encoding="utf-8")
+    assert await read_install_language(str(hint)) == "en-US"
+    assert await resolve_default_language(install_language="en-US") == "en-US"
+
+
+@pytest.mark.anyio
+async def test_read_install_language_missing(tmp_path: Path) -> None:
+    hint = tmp_path / "missing-agent"
+    await anyio.Path(hint).mkdir()
+    assert await read_install_language(str(hint)) == ""
+
+
+@pytest.mark.anyio
+async def test_resolve_default_language_falls_back_to_chinese(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("HAITUN_LANG", raising=False)
+    assert await resolve_default_language() == "zh-CN"
+
+
+@pytest.mark.anyio
+async def test_resolve_default_language_same_install_language_keeps_user_choice() -> None:
+    """Same-language update/install must not override the in-app choice."""
+    assert (
+        await resolve_default_language(
+            install_language="zh-CN",
+            user_language="en-US",
+            install_language_seen="zh-CN",
+        )
+        == "en-US"
+    )
+
+
+@pytest.mark.anyio
+async def test_resolve_default_language_changed_install_language_wins() -> None:
+    """User changed the language in the installer → installer wins."""
+    assert (
+        await resolve_default_language(
+            install_language="zh-CN",
+            user_language="en-US",
+            install_language_seen="en-US",
+        )
+        == "zh-CN"
+    )
+
+
+@pytest.mark.anyio
+async def test_resolve_default_language_fresh_install_uses_installer() -> None:
+    assert await resolve_default_language(install_language="zh-TW") == "zh-TW"

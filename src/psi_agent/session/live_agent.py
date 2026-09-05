@@ -3,7 +3,7 @@
 Some work cannot finish inside the turn that began it. Feishu authorization is the
 standard case: the code comes back only when the user gets around to tapping
 「同意授权」, so the wait is handed to a background task and the turn ends (see
-``examples/haitun-workspace/tools/_feishu_auth_watch.py`` for why waiting inside a
+``agents/feishu/tools/_feishu_auth_watch.py`` for why waiting inside a
 turn reads as "the bot is dead"). When that task finally succeeds, the thing the
 user actually asked for — 把文档建在他名下 —— is still undone, and there is no turn
 left to do it in: the background task has no tool loop, no model, no conversation.
@@ -118,12 +118,13 @@ async def resume_session_turn(
 
     message = with_kind({"role": "user", "content": content}, kind)
     logger.info(f"Resuming a turn on session {session_id!r} ({len(content)} chars, kind={kind!r})")
-    # Take the same lock a Channel turn takes: a resume is an ordinary turn and must
+    # Take the same guard a Channel turn takes (``turn_lock``: the session lock plus
+    # the deferred compaction it owes on release): a resume is an ordinary turn and must
     # not interleave with one that is already writing this conversation. ``aclosing``
     # rather than a bare ``finally: aclose()``: the agent loop's own cleanup (rollback /
     # commit) must run before this frame unwinds — the ordering every other
     # ``agent.run`` call site uses.
-    async with agent._lock, aclosing(agent.run(message, response_kind=kind)) as chunks:
+    async with agent.turn_lock(), aclosing(agent.run(message, response_kind=kind)) as chunks:
         async for _chunk in chunks:
             pass
     logger.info(f"Resumed turn on session {session_id!r} finished")

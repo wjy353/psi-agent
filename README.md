@@ -12,7 +12,7 @@
 - **Workspace 即 Agent**：在 `workspace/` 下丢几个 Python 函数就是 tools，写个 system prompt 就是 agent 人格，加个 cron 就是定时任务
 - **流式交互**：REPL/CLI 实时显示 AI 思考过程（dim 样式）和最终回复
 - **一键启动**：`psi-agent run config.yml` 一个命令拉起全套 AI + Session + Channel
-- **Web 管理中枢**：`psi-agent gateway` 启动 REST API + Web Console SPA，可视化创建/管理/对话
+- **Web 管理中枢**：`psi-agent gateway --gateway desktop` 启动 REST API + Web Console SPA，可视化创建/管理/对话
 
 ## 架构
 
@@ -23,7 +23,7 @@
 
 AI 层无状态、Session 层维护对话历史、Channel 层是纯 UI 客户端——三个核心组件独立进程，通过 socket 通信，协议为 OpenAI Chat Completions HTTP/SSE。Gateway 为 Web UI 提供 HTTP 接入，内部复用 Channel socket 与 Session 通信。
 
-对开发者：三个组件可独立启动、任意组合，适合调试和定制。对使用者：`psi-agent run config.yml` 一键拉起全部，`psi-agent gateway` 在浏览器里可视化管理一切。
+对开发者：三个组件可独立启动、任意组合，适合调试和定制。对使用者：`psi-agent run config.yml` 一键拉起全部，`psi-agent gateway --gateway desktop` 在浏览器里可视化管理一切。
 
 ## 快速开始
 
@@ -103,9 +103,11 @@ Servers（ai、session）持续运行，channel 组件按需退出（CLI 发完�
 启动 Gateway 后，在浏览器里可视化管理一切：
 
 ```bash
-uv run psi-agent gateway                         # 默认 127.0.0.1 随机端口
-uv run psi-agent gateway --listen http://127.0.0.1:8080   # 指定端口
+uv run psi-agent gateway --gateway desktop       # 127.0.0.1 随机端口
+uv run psi-agent gateway --gateway desktop --listen http://127.0.0.1:8080   # 指定端口
 ```
+
+`--gateway` **必填**，指定挂哪些 HTTP 面：`desktop` 是这里说的 Web Console（ToC 那面），`feishu` 是飞书那面（ToB），两个都写则两面全挂。没有默认值是故意的——少挂一面不会报错，只是某个前端 404，所以要求启动时说清楚。
 
 打开浏览器访问印出的地址，就会看到一个 Material Design 3 的 Web Console。界面里可以：
 
@@ -269,7 +271,7 @@ cron: "0 12 * * *"
 - 每个 schedule 有独立 CancelScope，支持热重载
 - 每个 schedule 独立加载——IO 错误、YAML 解析问题、cron 验证失败只跳过该 schedule
 - Schedule 触发时自动获取 session lock，串行处理
-- **定时任务归 workspace，触发权归 (session × schedule)**：`schedules/` 始终从 workspace 加载（分离根部署时不从 `--agent` 包加载）；每个 Session 都读到全部条目，但**逐条**决定是否触发——`--active-schedules a,b` 只触发这两条，`--active-schedules '*'` 触发全部（含启动后新建的），`--deactive-schedules x` 从中排除（黑名单优先）。默认一条都不触发。「除某几条以外全归我」要写成 `'*'` + 黑名单：纯枚举白名单覆盖不到之后新建的 `TASK.md`。一条 schedule 必须恰好被一个 Session 激活，否则一条提醒会被在线会话数乘一遍（飞书为每个用户各开一个 Session）；Gateway 下由 `SchedulerManager` 为每个 workspace 维护唯一一个全量激活的调度 Session（挂哪个 AI 由 `psi-agent gateway --scheduler-ai-id` 决定，空则回落 `--feishu-ai-id`，两者都空就不起调度 Session）
+- **定时任务归 workspace，触发权归 (session × schedule)**：`schedules/` 始终从 workspace 加载（分离根部署时不从 `--agent` 包加载）；每个 Session 都读到全部条目，但**逐条**决定是否触发——`--active-schedules a,b` 只触发这两条，`--active-schedules '*'` 触发全部（含启动后新建的），`--deactive-schedules x` 从中排除（黑名单优先）。默认一条都不触发。「除某几条以外全归我」要写成 `'*'` + 黑名单：纯枚举白名单覆盖不到之后新建的 `TASK.md`。一条 schedule 必须恰好被一个 Session 激活，否则一条提醒会被在线会话数乘一遍（飞书为每个用户各开一个 Session）；Gateway 下由 `SchedulerManager` 为每个 workspace 维护唯一一个全量激活的调度 Session（挂哪个 AI 由 `psi-agent gateway --scheduler-ai-id` 决定，空则回落 `--feishu-ai-id`，两者都空就不起调度 Session；首个定时任务出现后、有可用 AI 时由常驻 `watch_loop` 自动拉起该调度 Session，最多等一个 30s 轮询周期）
 
 ### Skills
 

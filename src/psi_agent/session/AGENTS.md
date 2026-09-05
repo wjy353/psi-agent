@@ -20,7 +20,8 @@ ContextVar 是**隐式环境态**，比进程全局好（多 Session 不互踩�
 
 | | 约定 |
 |--|------|
-| **唯一写入方** | 仅 `SessionAgent.run`（对话整轮）和 `SessionAgent.handle_event`（事件匹配与触发器执行）经 `runtime_scope`。禁止 Gateway / Channel / AI / 测试外业务代码自行 `set_*` |
+| **唯一写入方** | 仅 `SessionAgent.run`（对话整轮）和 `SessionAgent.handle_event`（事件匹配与触发器执行）经 `runtime_scope`。禁止 Gateway / Channel / 测试外业务代码自行 `set_*`。**唯一例外**：`ai/server.py` 的 `handle_chat_completions` 用 `session_id_scope` 绑本回合会话 id，**只为日志归属**（那是另一个进程，ContextVar 过不来，值从请求体 `routing.session_id` 取），它不读任何 getter |
+| **会话 id ContextVar 住在哪** | `psi_agent/_session_context.py`——零项目内依赖的叶子模块。`_logging.py` 要把会话 id 拼进每行日志，而 import 本模块会带出 `session/__init__.py` → 它又 import `_logging`，循环。本模块里那几个同名函数是 re-export，`from psi_agent.session.runtime_context import get_session_id` 照旧可用，全项目仍只有一个 ContextVar。`workspace` / `agent` 两个仍住本模块：外层没人读 |
 | **`get_session_id()`** | 仅 **workspace 工具**需要「当前会话 id」时（如 `todo`、fusion memory、飞书授权续跑）。框架内部用 `Conversation.session_id` / 显式参数。工具起的后台任务里也读得到（`asyncio.create_task` 建任务那刻复制 ContextVar），这是「脱离本轮后还能找回原 session」的依据——见下方「续跑一个回合」 |
 | **`get_workspace()` / `get_agent()`** | 仅 **workspace 工具**在解析相对路径、找 agent 包根时（`write`/`bash`/`read` 等）。**框架核心**（`SessionAgent` / registries / Gateway / Channel）一律用构造时的 `workspace_path` / `agent_path` 或 REST 入参，**禁止**回读 ContextVar |
 | **Tool AI socket bridge** | `current_tool_ai_socket()` 仅在 `SessionAgent` 实际 await workspace tool 的区间返回当前 AI socket，并用 token 复位；它供 `run_flow` 创建受限的临时 Step Session，不进入 tool schema，也不能传播 API key/provider 配置。 |
@@ -51,7 +52,7 @@ ContextVar 是**隐式环境态**，比进程全局好（多 Session 不互踩�
 - System prompt 在首次 `run()` 调用时惰性构建（通过 `system_prompt_builder`）
 - `system_prompt_builder` 和 `system_prompt_rebuild_checker` 兼容旧的零参形式；如定义了位置参数，Session 会传入当前原始 `user_message`。这一显式参数只用于本轮动态 prompt，不会改变写入 history 的 `kind` 标记副本
 - 后续请求可调用 `system_prompt_rebuild_checker()`（如果定义），返回 True 则用同一条当前 `user_message` 重建 system prompt
-- 可选 `system_after_turn(user_message, assistant_message)` 在 `finish_reason="stop"` 的最终 assistant 消息已 commit 后执行。它是可恢复的 workspace hook：普通异常记 WARNING，不回滚已成功交付的回合；取消信号仍向外传播。未定义时使用 no-op 默认值
+- 可选 `system_after_turn(user_message, assistant_message)` 在 `finish_reason="stop"` 的最终 assistant 消息已 commit 后执行。它是可恢复的 workspace hook：普通异常记 WARNING，不回滚已成功交付的回合；取消信号仍向外传播。内核在 user 参数的 `_psi_history_provenance` 中附带可信的 history 路径、AppData 根及本回合 user/assistant 行号；同名请求字段会被过滤且不会写入 history。未定义时使用 no-op 默认值
 - 未整段重建时，提示词一字不改；若 agent 包定义了 `turn_context_builder()`，则每回合把易变块挂到**本回合 user 消息**上（见下方「每回合易变上下文」）
 - 可选生命周期顺序为 `system_before_turn` → `system_prompt_builder` → AI/tool loop → `system_after_turn`。`system_before_turn` 接收当前回合的临时 hook context（含额外请求参数副本）；普通异常、非 dict 返回值和超时降级为 `{}`，但绝不吞掉取消。其结果仅用于本轮 prompt 构建且不写入 history；除 OpenAI 保留字段外，原始请求参数仍透传给 AI。`schedule.*` 回合跳过该 hook。
 
@@ -70,11 +71,12 @@ ContextVar 是**隐式环境态**，比进程全局好（多 Session 不互踩�
    - reasoning（模型 thinking）→ `yield AgentChunk(reasoning=..., kind="thinking")`（上游 `delta.kind` 优先）
    - tool 执行起止 → 仍写入 **同一** `reasoning` 槽（刻意压缩，便于 Session↔AI OpenAI 形同构），`kind="tool_call"|"tool_result"`；正文可继续带 `[Tool Call:]`/`[Tool Result:]` 过渡标记
    - tool_calls → 累积（按 index 拼接 partial JSON）
-    - `finish_reason="tool_calls"` → 执行 tool → 结果追加到 history → 回到步骤 4
-    - finish_reason="stop" → 最终 content 追加到 history + `commit()` + 刷新 schedule registry + 若收到 compaction 信号则调用 `_maybe_compact()` → 释放锁
-   - finish_reason="error" → 回滚到快照 → `raise AgentError(message)`
-   - 任何未捕获异常 → 回滚到快照 → 向上传播
-6. 最多 `max_tool_rounds` 轮 tool call，达到上限时追加关闭 assistant 消息 + commit
+    - `finish_reason="tool_calls"` → 逐个过 `ToolCallConvergence.refusal_for()`（见「回合收敛」，被拒的**不发出**，改把说明性字符串当结果）→ 执行余下 tool → 结果追加到 history → 回到步骤 4
+    - finish_reason="stop" → 最终 content 追加到 history + `commit()` + 刷新 schedule registry + 若收到 compaction 信号则 `_request_compaction()` 记账 → 释放锁 → 锁外 `drain_pending_compaction()` 才真发压缩调用
+   - finish_reason="error" → 回滚到快照 → `raise AgentError(message)`（早期 `commit` 已清快照，**用户行保留**）
+   - Stop / 断开 / `aclose` → `_abandon_incomplete_turn` 截掉本回合再向上传播（**用户行不保留**）
+   - 其他未捕获异常 → 同 cancel（abandon）或随 `__aexit__` rollback，视是否走过早期 commit
+6. 最多 `max_tool_rounds` 轮 tool call（默认 `DEFAULT_MAX_TOOL_ROUNDS` = 20），达到上限时追加**面向用户**的说明性 assistant 消息 + commit
 7. **Turn 级别原子性**：``run()`` 所有正常出口调用 ``commit()``（save + clear snapshot）；异常时 ``async with`` 上下文管理器自动 ``rollback()``。内存和磁盘仅在同一检查点同步更新。
 
 **注意**：
@@ -84,7 +86,7 @@ ContextVar 是**隐式环境态**，比进程全局好（多 Session 不互踩�
 - `ChannelAdapter` 是纯无状态工具——不持有 agent/lock 引用。
 - Channel 请求中除 `messages` 外的不认识参数全部透传到 AI 层（`extra_params`）。
 - AI 返回多 choice 时报错（`finish_reason="error"`），0 choice 作为心跳跳过。
-- AI 返回非 200 或 `finish_reason="error"` 时，错误信息不写入 conversation history，且通过 turn 快照回滚机制保证本轮用户消息也不落盘。
+- AI 返回非 200 或 `finish_reason="error"` 时，错误信息不写入 conversation history；用户行因早期 `commit` **会**留在磁盘（崩溃重试基线）。Stop / 断开则走 `_abandon_incomplete_turn`，用户行一并去掉。
 
 ### 卡片回调直调短路（`_try_direct_card_dispatch`）
 
@@ -113,9 +115,41 @@ ContextVar 是**隐式环境态**，比进程全局好（多 Session 不互踩�
 
 两条都不触发时，提示词**一字不改**沿用。所以**易变内容一律不放提示词里**——放进去就会冻结在首次构建那一刻，改由每回合的 turn context 承载（下一节）。
 
+### 分项长度：那个 N 由哪些段构成
+
+上表的 `N chars` 是乘在**每个回合**上的固定成本，但单一总数没法回答「该裁哪一段」。
+`prompt_budget.PromptBudget` 负责拆账：workspace builder 用带标签的 `add()` 累积各段，
+`render()` 的返回值**就是**提示词本身，所以分项与总长同源、不会各算一套而悄悄漂移。
+
+- 配平是**构造保证**而非约定：`render()` 拼的正是 `breakdown()` 量的，连 `\n` 分隔符
+  都单列一项，因此 `residual` 恒为 0。它仍然照打，且非 0 时打 **WARNING**——非 0
+  意味着有文本绕过了标签（例如 builder 返回后又拼了东西），此时分项不可用来定裁剪量。
+- 日志级别是 **INFO**，不是 DEBUG。生产 `setup_logging` 钉死 INFO，本仓已经吃过
+  「最想看的数据恰好在 DEBUG 里」的亏。且走 loguru 而非标准库 `logging`：本项目
+  从未配置标准库 root logger，workspace 模块里的 `logging.getLogger(...).info(...)`
+  会在到达任何 sink 之前被丢掉（实测无输出，WARNING 才靠 lastResort 漏出来）。
+- **工具 JSON schema 不在这个总数里**：它们是 `agent.py` 请求体里与 `messages`
+  平级的 `tools` 字段，不是提示词文本。同样每回合全额付费，由
+  `log_tool_schema_size()` 单独记一行，好让裁剪决策看到两个数并列。
+
+### 6 个 hook 靠名字对上，写错了不报错
+
+`_load_module()` 用 `getattr(module, name, None)` 逐个查 `system_prompt_builder`、
+`system_prompt_rebuild_checker`、`compact_history`、`turn_context_builder`、
+`system_before_turn`、`system_after_turn`。名字拼错 → `None` → 静默走内核默认值；
+`agent.py` 只在缺 `compact_history` 时打一条 warning，其余 5 个连日志都没有。
+模块 import 失败时返回的也是 6 个 `None`，与「空模块」不可区分。
+
+因此 **12 个 workspace × 6 个 hook 的解析结果钉在
+`tests/psi_agent/session/test_workspace_hook_contract.py` 的 `EXPECTED` 表里**，
+少了、多了都失败。**不是「6 个全非 None」**——那不是本层的契约：builder / checker /
+before / after 有内核默认值，`turn_context_fn` 和 `compaction_fn` 的 `None` 本身承载语义
+（见「契约与容错」）。每个 workspace **必须**解析到的只有 `system_prompt_builder` 和
+`compact_history`，单列断言。workspace 换名或改 hook 名时，同步改 `EXPECTED`。
+
 ## 每回合易变上下文（turn context）
 
-`SystemPrompt.turn_context()` 在 `ensure()` 之后调用，渲染「本回合的现在」——时钟、可能随重新挂载而变的 runtime 行。产物**不进 system prompt**，而是挂在本回合 user 消息的 `turn_context` 键上（`history_display.TURN_CONTEXT_KEY`），只在 `messages_for_ai()` 投影时折进 `content`。
+`SystemPrompt.turn_context()` 在 `ensure()` 之后调用，渲染「本回合的现在」——时钟、可能随重新挂载而变的 runtime 行。产物**不进 system prompt**，而是挂在本回合 user 消息的 `turn_context` 键上（`history_display.TURN_CONTEXT_KEY`），只在 `project_history_for_wire()` 投影时折进 `content`。
 
 ### 为什么必须挂在尾部而不是提示词尾部
 
@@ -145,7 +179,7 @@ ContextVar 是**隐式环境态**，比进程全局好（多 Session 不互踩�
 | **构建失败** | `except Exception` 记 ERROR 后返回 `""`，不中断回合。**丢一行时钟远好过丢掉整个回合** |
 | **返回值不可用** | 非 `str` / 空串 / 纯空白一律当「没有这个块」 |
 | **为什么不给 `turn_context_fn` 设默认函数**（不同于 `builder` / `checker` 的「Default over None」，见根 AGENTS.md 坑 8） | 默认函数只能返回空串，那与 `None` 语义重合、却多一次无谓的 `await`；且 `None` 在这里承载**可观测的语义**——「这个 workspace 没有易变块」。`compaction_fn` 同样保持 `None` |
-| **为什么不单独发一条尾部消息** | 不是因为发不出去——Anthropic 会把连续的同角色轮次**合并成一条**（"Consecutive `user` or `assistant` turns in your request will be combined into a single turn"），不报错。真正的理由是那条消息**必须落进 history 才能发出去**（`messages_for_ai()` 只投影已有行，凭空插一条就要在投影期造行），于是每回合都往历史里多塞一条一次性的时钟消息：历史被噪音撑大、压缩时还得判断哪些该丢。挂在本回合 user 消息上则一行不多、且天然随该回合一起过期 |
+| **为什么不单独发一条尾部消息** | 不是因为发不出去——Anthropic 会把连续的同角色轮次**合并成一条**（"Consecutive `user` or `assistant` turns in your request will be combined into a single turn"），不报错。真正的理由是那条消息**必须落进 history 才能发出去**（`project_history_for_wire()` 只投影已有行，凭空插一条就要在投影期造行），于是每回合都往历史里多塞一条一次性的时钟消息：历史被噪音撑大、压缩时还得判断哪些该丢。挂在本回合 user 消息上则一行不多、且天然随该回合一起过期 |
 | **`USER.md` / `HEARTBEAT.md` 归谁** | 留在提示词里——它们是「当作长期上下文读」的散文，不是本回合的新闻。文档承诺的「re-read every turn」由 `system_prompt_rebuild_checker()` 按**内容哈希**兑现：字节真变了才整段重建，改一次付一次，而不是每回合付一次 |
 
 ## 其他约定
@@ -197,7 +231,7 @@ result = run.result   # 正常耗尽后非 None
 |------|----------|--------------|-----------------------|
 | 模型正常 `stop` | `COMPLETED` | `MODEL_COMPLETED` | `"stop"` |
 | 模型因 `length` 等停止 | `INCOMPLETE` | `MODEL_STOPPED` | 原始值 |
-| 达到 `max_tool_rounds` | `INCOMPLETE` | `AGENT_TURN_LIMIT` | 通常 `"tool_calls"` |
+| 达到 `max_tool_rounds`（默认 20） | `INCOMPLETE` | `AGENT_TURN_LIMIT` | 通常 `"tool_calls"` |
 | 流里从未出现 finish reason | `INCOMPLETE` | `INVALID_MODEL_STREAM` | `None` |
 | 模型 / Session 执行错误 | 不产出 result | 不适用 | 抛 `AgentError` |
 
@@ -206,6 +240,7 @@ result = run.result   # 正常耗尽后非 None
 - **`stop_cause` 与 `model_finish_reason` 分两列**，不合并：后者是模型的原始诊断串（照抄，含本代码还不认识的新 reason），前者是 **runtime 视角**的停止原因。多个 finish reason（以及「压根没有」）会 collapse 成同一个 runtime cause，而 `AGENT_TURN_LIMIT` 在模型侧根本没有对应值。
 - **`None` finish reason 单独归 `INVALID_MODEL_STREAM`**，不跟 `MODEL_STOPPED` 混：排错时「模型提前停了」和「我们没听到它为什么停」是两回事。
 - **`AGENT_TURN_LIMIT` 而非 "tool limit"**：受限的是 agent/model loop 的**轮数**，一轮可能含多个工具调用。配置名 `max_tool_rounds` 暂留以兼容。
+- **`AGENT_TURN_LIMIT` 是唯一会主动告诉用户的终态**：默认上限从 128 降到 20（实测 p50=3 / p90=13 / max=49，128 永远碰不到 = 等于没有上限）之后，这个分支在正常使用中**够得到**，而它终止的那条回复按定义是半截的（模型刚要继续调工具）。所以除日志外还向 content 槽 `yield` 一条 `MAX_ROUNDS_NOTICE`：原先的裸 `[Max tool rounds reached]` 是未翻译的开发者标记，粘在模型的过渡话术后面（`让我再查一下。[Max tool rounds reached]`），用户只看到一条读不出所以然的半截回复，分不清是撞上限还是崩了。其余终态仍只写日志，`result` 归调用方读。
 - **`run()` 保留**为 `run_streamed()` 的丢弃 result 版本（纯 `AsyncGenerator`），schedule / trigger runner 等现有调用点一字不改。
 - **SSE 线上形状不变**：result 归调用方读，永不作为 chunk 进流。`handle_request` 只把它写进日志（不完整则 WARNING，与 loop 内 `Reached max tool rounds` / `Unexpected finish_reason` 同级）。`ChannelAdapter.write()` 用结构化 `_ChunkStream` Protocol 同时接 `AgentRun` 和裸 generator——直接 import `AgentRun` 会让 `agent` ↔ `channel_adapter` 成环，而适配器除了迭代 + 关闭并不需要 run 的任何东西。
 - **`AgentRun` 显式实现 `aclose()`**（转发给内部 generator）：它本身不是 async generator，缺了这个方法根 AGENTS.md 坑 16 的 `async with aclosing(run)` 就会 `AttributeError`。消费方一律照旧用 `aclosing()` 包裹，提前退出 / 被 cancel 时 loop 内 `aclosing(ai_client.stream(...))` 才会随之释放上游连接。
@@ -348,6 +383,40 @@ provider 只认 `reasoning_content`（any-llm 的 `REASONING_FIELD_NAMES` 首项
 - 只截 `role="tool"`。长的 user 消息是用户自己写的字，截它等于替用户改话；非 `str` 的
   结构化 `content` 没有有意义的前缀，不动
 
+**这道上限只管单行，管不了总量**：一万行各 2 万字符照样超预算，而「发出时就被拒、拿不到压缩信号、
+重试重建同样载荷、重启无效」这条死锁路径与本节完全相同。总量由装配点的预算兜住（见「请求装配点与
+预算」）：超预算的 body **装不出来**，所以发不出去。两处是同一个问题的单行版与总量版，都不能删。
+
+### 回合收敛（`tool_convergence.py`，刻意为之，勿"修掉"）
+
+`feishu_docs_search` 曾被**换着关键词连调 305 次**，直到上游返回 HTTP 402。循环里没有一处是坏的：
+每次调用都合法，每次结果都是诚实的「没搜到」，模型拿到这个只能换个说法再试。缺的不是调用次数上限，
+而是**「确实没有」与「这条路已经走到头」在模型眼里长得一模一样**。
+
+所以做法是**把话说出来，而不是悄悄停掉**。超阈值后该调用**不发出**，顶替它的字符串写明：哪个工具、
+第几次、这一次没有真正执行、以及该改做什么。**这里返回空结果比不加限制更糟** —— 模型会读成「还是
+没有」，于是再换一个词，正好是要收的那个环。这与 `truncate_tool_result` 的理由是同一条：不声明自己
+的截断，会被拿去当全量数据作答。
+
+两个计数器，对应事故的两种形状：
+
+- **连续无效，按工具名计数**（`UNPRODUCTIVE_LIMIT = 4`）。换词能绕开任何按参数计数的判据 —— 「换词
+  调 305 次」说的就是这件事，跨这些重试唯一稳定的键是工具名。**计的是连续**：一旦出结果就清零
+  （`record`），因为有结果证明这个工具与这个查询形状是通的；终身次数由 `max_tool_rounds` 兜。
+- **原样重复，按 (工具名, 参数) 计数**（`REPEAT_LIMIT = 3`）。参数键用 `sort_keys=True`：模型发同一个
+  查询时 key 顺序会变，不排序则重复计数器永远不触发。3 而非 1 是因为重复并不总是无意义 —— 这里的工具
+  会轮询外部状态（正在被编辑的文档、还在跑的后台进程）。
+
+- **无效判定同时覆盖「成功但空」与「调用失败」**：从调用方看这是同一件事——又一次没推进；驱动失控的是
+  重试，不是这两者中哪个发生了。空 JSON 信封（`{"items": []}`、`total: 0`）必须算空，它不是空字符串，
+  过不了任何长度判断。
+- **作用域是一个回合**：tracker 随 `run()` 生死，计数不会漏到下一个问题，用户说「再试一次」拿到的是
+  真的重试而不是上一轮继承来的拒绝。
+- **拒绝不进计数器**（`REFUSAL_PREFIX` + `is_refusal_notice`，与 `_TRUNCATION_MARKER` 同一手法）。
+  装配点已经跳过了拒绝，这道守卫把「跳过」从约定变成结构：两条提示语自身按措辞就会被判成无效结果
+  （其中一条含「没有查到」），一旦被回灌，计数器就靠本模块自己编造的证据往上爬，阈值变成整回合封杀。
+  **变异复核实测：不加这道守卫，「把拒绝也记进计数器」这个变异逃过了其余全部判据**。
+
 ## Schedule 机制完整流程
 
 ```
@@ -355,7 +424,7 @@ provider 只认 `reasoning_content`（any-llm 的 `REASONING_FIELD_NAMES` 首项
   while True:
     _seconds_until_next(cron)   ← 本地墙钟下次触发（勿用 time.time() 作 croniter base；TZ 设了则按该时区）
     await anyio.sleep(wait)     ← 睡到触发
-    async with agent._lock:       ← 等当前请求完成
+    async with agent.turn_lock():  ← 等当前请求完成; 出块后补做欠下的压缩(锁外)
       if fire == tool:
         ToolRegistry.get(tool)(**tool_args)  ← 直调，不跑 LLM（飞书提醒等）
       else:  # fire == prompt（缺省）
@@ -370,7 +439,7 @@ provider 只认 `reasoning_content`（any-llm 的 `REASONING_FIELD_NAMES` 首项
 - **`fire: tool`（刻意为之）**：到点 Session **直接** `ToolRegistry.get(tool)(**tool_args)`，**不跑 LLM**。用于飞书提醒等必须可靠推送的场景；YAML 含 `tool` + `tool_args`。`fire: prompt` 仍把 TASK 正文当 user message 交给 agent（heartbeat / 日报等）。workspace `schedule_manage` 对飞书提醒应写 `fire=tool`
 - **`run_once: true`（刻意为之）**：成功跑完一轮后删除对应 `TASK.md`（及空目录）并结束该 runner，避免「单次提醒」因 5 段 cron 无年份而次年再触发。workspace 工具 `schedule_manage` 的 `once_at` 会写入此字段
 - **cron 按本地时间解释（刻意为之，勿改回 UTC）**：`_seconds_until_next` 用 `datetime.now()` + `croniter`，**禁止**把 Unix timestamp 交给 `croniter` 当 base——后者会把 5 段字段当 UTC，导致 `once_at` 写的本地时刻在非 UTC 机器上晚数小时才触发。workspace `schedule_manage` 的 `once_at`/`cron` 语义都是本机墙钟。此外若设了标准 `TZ` 环境变量，`ScheduleRegistry._schedule_tz()` 解析成 `ZoneInfo` 并以 `datetime.now(tz)` 作 base，让 cron 字段按该时区解释（如 UTC 容器设 `TZ=Asia/Shanghai` 则 `0 9 * * *` 按北京 9 点触发）；`TZ` 未设 / 非法时退回 naive `datetime.now()`，行为与默认一致，不额外依赖 `tzdata`
-- **消息 ``kind``（JSONL provenance，敲定协议）**：OpenAI ``role`` 不变；用正交字段区分对话来源（``chat`` / ``schedule.display`` / ``schedule.silent`` / …）。Gateway ``/history`` 只返回 ``is_displayable_chat_message``。AI 请求经 ``messages_for_ai`` 剥掉消息 ``kind``/遗留 ``chat_type``。**≠** SSE / ``AgentChunk.kind``（``thinking`` / ``tool_call`` / ``tool_result``）——后者只标过程流 provenance，不进 history 白名单语义
+- **消息 ``kind``（JSONL provenance，敲定协议）**：OpenAI ``role`` 不变；用正交字段区分对话来源（``chat`` / ``schedule.display`` / ``schedule.silent`` / …）。Gateway ``/history`` 只返回 ``is_displayable_chat_message``。AI 请求经 ``project_history_for_wire`` 剥掉消息 ``kind``/遗留 ``chat_type``。**≠** SSE / ``AgentChunk.kind``（``thinking`` / ``tool_call`` / ``tool_result``）——后者只标过程流 provenance，不进 history 白名单语义
 - ``visibility: silent`` 的 schedule（heartbeat）结果永不 pending、永不展示
 - ``visibility: display`` 的 schedule 结果可进 history，并通过 pending 随下次 ``POST /chat`` 带回（``/events/schedule`` 推送通道仍待定）
 - `fire: prompt` 触发只是 Session 内再跑一轮 agent（TASK 正文当 user message）——**不会**自动往飞书推 IM；`fire: tool` 才按 YAML 直调工具（如 `feishu_message_send`）
@@ -388,7 +457,7 @@ provider 只认 `reasoning_content`（any-llm 的 `REASONING_FIELD_NAMES` 首项
 
 - **按 session id 索引，不设全局「当前 agent」**：Gateway 一进程多 Session，全局量会续跑到最后注册的那个。调用方传自己从 `runtime_context.get_session_id()` 拿到的 id
 - **注册与「正在服务」同生命周期**（`register` 是上下文管理器）：过期句柄会续跑一个没人听的对话
-- **续跑照样拿 `agent._lock`**：续跑不是特权。真用户的轮次在跑就等它，跳锁会让两轮交错写同一份 conversation
+- **续跑照样拿 `agent.turn_lock()`**：续跑不是特权。真用户的轮次在跑就等它，跳锁会让两轮交错写同一份 conversation。取 `turn_lock` 而非裸 `_lock`，是因为续跑就是个普通回合，它欠下的压缩同样要在锁外补做
 - **投递是调用方的事**：这里 yield 的 chunk 没人在流式接收（不是任何请求打开的轮次），所以续跑那一轮要说话必须调 `feishu_message_send` 之类的工具——与 `fire: prompt` 的 schedule 同理（见上节）
 - **`kind` 缺省 `trigger.silent`（刻意为之，勿"改成 `chat` 让它显示出来"）**：续跑是**带外回合**，与 trigger / silent schedule 同类，所以注入的 `<event>` 块和它的回答都不进 Gateway `/history` 的聊天气泡。给 `chat` 会有两处后果——那段给模型的指令正文会像用户亲手打的一样出现在记录里，而回合已经用工具把话说过一遍了，气泡是第二遍。要让回答进 Web Console 就显式传 `trigger.display`（`response_kind` 与 user 行的 `kind` 同值，与 `_fire_prompt` 一致）
 - 起不了回合时（无在服务的 live agent）返回 `False`，调用方必须退回它力所能及的方式（通常一条通知），否则活会被静默丢掉
@@ -434,10 +503,19 @@ provider 只认 `reasoning_content`（any-llm 的 `REASONING_FIELD_NAMES` 首项
 | **event** | 业务稳定名；Session **不**维护名单 |
 | **信封** | ``source`` + ``event`` + ``payload``；可选 ``raw_event`` / ``raw_payload`` |
 | **匹配（刻意为之）** | 先 ``event``+``filter``；未命中再 ``raw_event``+``raw_filter`` |
+| **空 filter（刻意为之）** | **不匹配任何事件**；放行一切要显式写 ``filter: {match: all}`` |
 | **落盘挂钩** | ``{Session.agent}/triggers/``；haitun ``trigger_manage`` |
 | **kind** | ``trigger.silent`` / ``trigger.display`` |
 
 无 TRIGGER 时事件仍可进门，matched/fired 为空（能力开、钩子关）。
+
+**空 filter 语义（刻意为之，2026-09-03 收口）**：``filter_matches`` 曾用 ``all([])`` 为 ``True``，于是**留空等于放行一切** —— 最宽的设置也是最容易误撞的设置。2026-09-02 生产实测：某 trigger 写了 ``filter: {chat_id: …}`` 与 ``raw_event:`` 却没写 ``raw_filter``，normalized 路按 chat_id 正确拒绝后落到 raw 路，空 ``raw_filter`` 放行**所有人所有会话的每条飞书消息**，一句「你好」跑两个回合；1056 次注入已烤进 ``compacted`` 摘要，删 TRIGGER.md 也带不走。
+
+现在：空 filter 匹配**零个**事件；要放行一切必须显式写 ``{match: all}``（``event_protocol.MATCH_ALL``）。因此 **raw 路不可能比 normalized 路更宽** —— 结构性消除，不是加一条校验。``trigger_manage`` 创建时直接拒绝空 ``filter``，以及「有 ``raw_event`` 却空 ``raw_filter``」，免得造出永不触发的钩子。
+
+**``fire=tool`` 无变更不写历史（件二A 写入准入）**：定时 trigger 每几分钟写 2 行，无论有没有实际变更，而那些行不携带信息、却让此后每回合的装配都变贵。``tool_result_is_noop`` 判定「工具报告什么都没变」（``ok: true`` + 至少一个已识别的变更计数 + 全为 0 + 无 ``errors``），此时两行都不写；非 JSON、不认识的形状、失败、任何 error 一律照写 —— 吞掉一次**失败**等于用一行便宜历史换一次看不见的故障。跳过时历史前缀逐字节不变，上游前缀缓存继续命中。
+
+代价（刻意为之）：``_fire_tool`` 现在**先跑工具再写**，不再先落 user 行做崩溃恢复基线 —— ``fire=tool`` 没有要续跑的 LLM 回合，而那条基线会强迫「什么都没变」也写一次。工具跑到一半崩溃现在历史里不留痕（点火本身仍进日志）。
 
 **``fire=tool`` 与动态 payload（刻意为之）**：TRIGGER.md 里 ``tool_args`` 是静态的。若 tool 形参声明了
 ``event_payload_json`` / ``event_name`` / ``raw_event`` / ``event_source``，且 YAML 未给非空值，
@@ -465,15 +543,15 @@ Session 支持将对话历史持久化到 AppData `histories/{session_id}.jsonl`
 - **读**：优先 AppData 文件；缺则双读 legacy `{workspace}/histories/{session_id}.jsonl`
 - `Session.session_id: str | None = None` — None 时自动生成 UUID，给定字符串时可 resume
 - 加载：`SessionAgent.create()` → `Conversation.from_workspace(..., appdata_root=…)` 双读
-- **Turn 级别原子性**：`SessionAgent.run()` 每次调用通过 ``async with self._conversation`` 进入上下文管理器，首次 `add()` / `replace_system()` 自动建立快照。user message 追加后立即 `commit()`（早期落盘，崩溃恢复基线），后续仅在对 AI 响应成功的检查点再次 `commit()` 更新；任何异常（AI error、连接断开、cancellation）都会通过 ``__aexit__`` 自动触发 `Conversation.rollback()` 恢复到快照，保证内存和磁盘始终同步于最近一个成功阶段。
+- **Turn 级别原子性**：`SessionAgent.run()` 每次调用通过 ``async with self._conversation`` 进入上下文管理器，首次 `add()` / `replace_system()` 自动建立快照。user message 追加后立即 `commit()`（早期落盘，崩溃恢复基线），后续仅在对 AI 响应成功的检查点再次 `commit()` 更新；`AgentError` 时 ``__aexit__`` 触发 `Conversation.rollback()`——但早期 `commit()` 已清快照，**用户行会保留**（崩溃重试基线，刻意为之）。**Stop / 客户端断开 / generator `aclose`（刻意为之）**：早期落盘之后取消不等于「保留用户问题」——SPA Stop 只撤回本地草稿，若不删 Session 侧那行，下一轮发送会看到「撤回前的问题 + 改写后的问题」，模型把两段一起想。故 cancel 路径调 `_abandon_incomplete_turn`：`truncate_to(turn_start)` 再 `commit()`，整回合（含中途已落盘的 tool 行）一并丢掉；`AgentError` 不走这条。
 - 保存时机（一致性检查点）：
-  - `finish_reason="stop"` — assistant 响应追加后立即 `commit()`，随后刷新 schedule registry（完整回合）；若收到 compaction 信号则 `_maybe_compact()` 插入 `compacted` 消息并 `commit()`
+  - `finish_reason="stop"` — assistant 响应追加后立即 `commit()`，随后刷新 schedule registry（完整回合）；若收到 compaction 信号则 `_request_compaction()` 记账，插入 `compacted` 消息与 `commit()` 由锁外的 `drain_pending_compaction()` 完成
   - `finish_reason="tool_calls"` — 所有 tool 结果追加后立即 `commit()`（子回合）
   - unexpected `finish_reason` — 累积 content 追加后 `commit()`
-  - 达到 `max_tool_rounds` — 追加 `[Max tool rounds reached]` assistant 消息后 `commit()`
-- 只有 reasoning、没有 `content` / `tool_calls` 的最终 assistant 不写入 history；reasoning 仍可流式输出并传给 after-turn hook。读取旧 JSONL 时，`messages_for_ai()` 同样过滤这类不符合 OpenAI wire contract 的遗留行，避免上游返回 `Invalid assistant message`
+  - 达到 `max_tool_rounds` — 追加 `MAX_ROUNDS_NOTICE`（含实际轮数的中文说明，以 `[已达到单轮工具调用上限, 停在这里]` 开头）assistant 消息后 `commit()`
+- 只有 reasoning、没有 `content` / `tool_calls` 的最终 assistant 不写入 history；reasoning 仍可流式输出并传给 after-turn hook。读取旧 JSONL 时，`project_history_for_wire()` 同样过滤这类不符合 OpenAI wire contract 的遗留行，避免上游返回 `Invalid assistant message`
 - `Conversation.save()` 使用 tempfile + `os.replace()` 实现原子写入；`commit()` 封装 save + 清除快照
-- **部分保存**的场景：`finish_reason="error"`、AI 连接断开、channel 断开、schedule runner 异常——user message 已通过早期 `commit()` 落盘，AI 响应部分通过 `rollback()` 回滚，不写入磁盘
+- **部分保存**的场景：`finish_reason="error"`（及同类 `AgentError`）——user message 已通过早期 `commit()` 落盘，AI 响应不写入。**Stop / channel 断开**不在此列：走 `_abandon_incomplete_turn`，用户行也从磁盘去掉（见上「Turn 级别原子性」）。
 - 首次使用时自动创建 AppData `histories/` 目录 + `.gitignore`（忽略全部文件）
 
 ## Context Compaction
@@ -482,16 +560,51 @@ Session 支持将对话历史持久化到 AppData `histories/{session_id}.jsonl`
 
 1. `AiClient.stream()` 解析 `psi_compaction` → `AiDelta.compaction_needed=True`，并把
    `prompt_tokens` / `threshold` 一并透出（经 `AiClient._as_int`，缺失或非法为 0）
-2. Agent loop 在 `finish_reason="stop"` 后调用 `_maybe_compact(prompt_tokens, threshold)`
-3. 从 `{agent}/systems/system.py` 提取 `compact_history()` 函数
+2. Agent loop 在 `finish_reason="stop"` 后调用 `_request_compaction(prompt_tokens, threshold)`
+   —— **只记账，不发起调用**（同步方法，此时仍持锁）。真正的 LLM 调用由
+   `turn_lock()` 在**释放锁之后**通过 `drain_pending_compaction()` 发起（见下「压缩不占会话锁」）
+3. 从 `{agent}/systems/system.py` 提取 `compact_history()` 函数（`getattr` 按名字查找，见下
+   「默认实现的归属」）
 4. **冷却门槛**：`_compaction_cooldown_elapsed()` 不过则直接返回（见下）
 5. 构造 `complete_fn`（使用现有 `AiClient` 做流式调用并收集全部 content 的闭包）
-6. `summary = await compact_history(conversation.messages, complete_fn)`
+6. **先取快照** `snapshot = list(conversation.messages)`，`covers = len(snapshot)`，
+   然后 `summary = await compact_history(snapshot, complete_fn)`。取快照是因为此时**不持锁**，
+   新回合可以往 `messages` 追加行；摘要只描述快照那一段
 7. **落盘前校验** `_summary_looks_hijacked()`（见下「摘要落盘校验」）：判为劫持则重试一次，
-   仍失败则不写入；通过后插入独立的 `compacted` 消息（`role="compacted"`, `kind="compacted"`）
-8. `commit()` 落盘——历史消息**保留**，不删除；随后记录水位线
-   `_tokens_at_last_compaction`（**仅成功时**记，失败没缩小任何东西，下次信号仍应放行）
-9. 下次发送 AI 请求时，`messages_for_ai()` 负责：找到 system prompt 和最后一个 compacted，删除中间消息，将 compacted 内容合并到 system prompt
+   仍失败则不写入；通过后插入独立的 `compacted` 消息（`role="compacted"`, `kind="compacted"`,
+   `covers=<快照长度>`）
+8. **重新取锁**（只包住写入）后 `commit()` 落盘——历史消息**保留**，不删除；随后记录水位线
+   `_tokens_at_last_compaction`（**仅成功时**记，失败没缩小任何东西，下次信号仍应放行）。
+   写入是纯尾部追加，所以走 `Conversation.save()` 的追加路径，不触发全量重写
+9. 下次发送 AI 请求时，`project_history_for_wire()` 负责：找到 system prompt 和最后一个 compacted，
+   删除**摘要覆盖到的那一段**（按 `covers` 切，不是按 compacted 行自身的下标切），
+   将 compacted 内容合并到 system prompt
+
+### 压缩不占会话锁（件四，2026-09-03）
+
+压缩是一次 LLM 调用，实测 41.5 秒。它发生在回合**正常完成之后**——回复已流式发出、
+assistant 行已写历史、`commit()` 已落盘（见 `agent.py` 的调用点：`_finish` 前最后一句）。
+所以这 41.5 秒对已完成的那个回合**毫无贡献**，却被完整记在**下一条消息**的等待里：
+实测排队 p50 曾达 169 秒，2026-08-31 恶化到 774 秒。尾部工作没有理由持锁。
+
+改法：`SessionAgent.turn_lock()` 取代裸 `self._lock`，语义是「持锁跑一个回合，
+**释放锁之后**再补上这个回合欠下的压缩」。四个驱动回合的入口全部改用它
+（`handle_request` / `handle_event` / `schedule_registry` 的 schedule 触发 / `live_agent` 的续跑）——
+**不是四处各自记得 drain**：漏一处的后果是那条路径永不压缩，而且不会有任何用例变红
+（件一A 的省略保证请求始终合法，唯一症状是质量在数周里烂掉）。
+
+并发上的四个明确答复：
+
+| 问题 | 答复 |
+|---|---|
+| 压缩期间来的新消息基于哪个版本的历史？ | 未压缩的那版。它照常拿锁跑完整回合，与今天一致——本来也拿不到还没生成的摘要 |
+| 压缩完成时历史已变，摘要还能用吗？ | 能，但**只对它覆盖的那一段**有效。`covers` 记下快照长度，投影按它切。若按 compacted 行自身下标切，压缩期间落的行会从 wire 上消失却仍留在 JSONL 里——静默丢历史，且单独测压缩永远看不见 |
+| 压缩失败/超时？ | `_maybe_compact` 内 `except` 吞掉并只打日志：不写 `compacted` 行、不记水位线、回合本身不受影响、会话继续可用。件一A 之后压缩只管质量不管正确性，所以失败只等于「这次省略糙一点」，判据 `test_compaction_failure_does_not_break_the_turn` 锁住这条 |
+| 同一会话并发触发两次压缩？ | `_compaction_in_flight` 让第二个 drain 直接返回。两份 `compacted` 行的后果不只是白花一次调用（投影取最后一行），而是两行的 `covers` 不同时，存活那行可能切掉存活摘要从没描述过的行。跳过是安全的——信号是电平触发，仍超阈值则下个回合再报 |
+
+判据在 `tests/psi_agent/session/test_compaction_off_lock.py`，四条全做过变异复核。
+其中最要紧的一条不测「摘要对不对」，而测**压缩堵在半路时第二个回合能否跑完**——
+那才是本件的全部意义。
 
 JSONL 留存：``system, u1, a1, u2, a2, compacted(summary), u3, a3, ...``
 发给 AI：``[system+summary, u3, a3, ...]``
@@ -506,7 +619,21 @@ async def compact_history(
 ```
 
 未定义时 → 记录 warning，跳过压缩，history 持续增长。
-多次 compaction → 每次插入独立的 `compacted` 消息；`messages_for_ai()` 仅取最后一条合并到 system prompt。
+
+### 默认实现的归属（`session/_compaction.py`）
+
+这 90 行原本抄在每个 workspace 的 `systems/system.py` 里，12 个 example 中有 **11 份逐字节
+相同**——字节相同说明没有任何 workspace 需要它不同，那它就是引擎行为放错了层，修一次要改
+十一遍。现已收进 `session/_compaction.py`，那 11 个 workspace 改为 re-export。
+
+- **搬迁只是去重，行为一字未改。** 它**没有**给谁「补上」抗注入防护：真实防线是本层的
+  `_summary_looks_hijacked()`，对所有 workspace 一直生效，与函数住哪儿无关；而函数自带的
+  `TRANSCRIPT_IS_DATA` 标记 + 指令后置，搬迁前 12/12 全都有。
+- **必须 re-export，不能只在内部 import。** hook 查找是 `getattr(module, "compact_history")`，
+  名字得能在 workspace 模块上解析到。
+- **覆盖方式**：workspace 直接自己定义 `compact_history`（后定义的绑定生效）。
+  `haitun-supervisor-workspace` 就是这样保留了自己那份 71 行的变体，未纳入本次去重。
+多次 compaction → 每次插入独立的 `compacted` 消息；`project_history_for_wire()` 仅取最后一条合并到 system prompt。
 这一步安全的前提是默认实现**链式累积**（新摘要在上一份之上更新，故包含而非丢弃更早
 上下文）；若自定义的 `compact_history` 忽略传入的 `compacted` 行，则每压一次就少一层
 历史——这正是「时不时压缩就忘记前面对话」的成因。
@@ -521,9 +648,9 @@ async def compact_history(
 
 两侧一起改才闸得住：
 
-- **提示词侧**（各 workspace `system.py`）：原文用 `<transcript>` 围栏包裹、声明为待总结的
-  数据、「请总结」在围栏**之后**复述，与劫持指令争同一个尾部位置；原文里的 `</transcript>`
-  转义掉，防止逃逸。
+- **提示词侧**（默认实现在 `session/_compaction.py`；workspace 自定义时自负其责）：原文用
+  `<transcript>` 围栏包裹、声明为待总结的数据、「请总结」在围栏**之后**复述，与劫持指令争同一个
+  尾部位置；原文里的 `</transcript>` 转义掉，防止逃逸。
 - **落盘侧**（本层）：`_summary_looks_hijacked(summary, source_chars)` 判为劫持则重试一次，
   仍失败则**不写入**——宁可这回合不压缩（下回合会重试），也不能把整段对话换成模型的一句
   回话。
@@ -559,6 +686,43 @@ async def compact_history(
   `required` 之上——门会把压缩锁死。线上实测：18 小时内 25 次冷却拦截有 **24 次是负增长**，
   即这道门正因为「上次压缩起作用了」而拒绝再压。收缩是机制生效的证据，且信号只在
   `prompt_tokens` 仍超阈值时才发，所以这恰恰是该压缩的时刻。
+
+### 请求装配点与预算（`request_assembly.py`，两级成本控制的第一级）
+
+`RequestAssembler.build(history, tools, extra)` 是**唯一**的请求装配点，返回载荷与实测字符数，
+并**保证载荷不超预算**。此前预算只由 AI 层观测（`ai/server.py`）、Session 层事后反应
+（`_maybe_compact`），于是超预算请求**装得出来也发得出去**，被上游 400 拒掉后每次重试都重建同一个
+过大的 body —— 2026-09-02 生产靠手改 history 文件才恢复。改后这种 body **装不出来**，问题按结构消掉。
+
+**两级分工**：第一级省略（elision）丢最老最大的行、只留句柄，确定性、必然成功、纯本地、零成本，
+**正确性归它**；第二级压缩（compaction）是 LLM 摘要，best-effort、会失败、约 18 秒、还占着会话锁，
+**只负责质量**。所以压缩失败不再意味着死锁，只意味着省略得更粗。
+
+- **省略必须滞回（`SHRINK_TARGET_FRACTION = 0.5`，这是设计本身，不是可调参数）**：历史 append-only
+  所以对前缀缓存友好（实测命中 19456/19519），但**任何收缩都会重写前缀 → 全量 miss**。每回合削一行
+  刚好压线，就等于每回合全量 miss，比不收缩更贵。故一次收缩要直接降到预算的一半，让后面很多回合长在
+  同一个稳定前缀上。**别每天从行李箱扔一件，一次清掉半个后备箱。**
+- **滞回有两半，少一半从单回合看不出来**：`_elided_row_ids` 记住已省略的行，每回合先原样重新省略
+  （`_reapply_sticky_elisions`），再判断是否需要新的省略。缺这一半则下回合投影出完整行、涨回去、
+  再省略，前缀每回合都变。
+- **句柄刻意极短**（`[已省略 N 字符, 句柄 X]`）：句柄是**每条被省略的行付一次**的，第一版带了一句
+  「完整原文仍在会话历史文件中，可用文件工具检索」的说明、约 220 字符，34 行就是 7.5KB，自己变成新的
+  不可省略下限 —— 实测撞到过「省略完全部行仍超预算」。那句说明属于 system prompt，付一次就够。
+- **不删行、只换 `content`**：`tool_calls` 与其 `tool` 返回必须成对，删任一半请求就非法。
+- **预算以字符计，比值每回合用上游自己的 `prompt_tokens` 校准**（`calibrate`）。不引 tokenizer、不加
+  依赖。实测同一仓库内字符/token 跨度 **2.6 倍**（中文散文 1.56，ASCII 工具 JSON 3.5-4），所以单一
+  硬编码系数必然对某一类内容是错的。首回合用保守默认 1.5（保守 = **偏低**，因为预算 = token x 比值，
+  偏低是欠装 = 安全）。数字来自 `AiDelta.usage_prompt_tokens`，与压缩信号上那个 `prompt_tokens`
+  **刻意分开**：后者只在超阈值后才出现，太晚了。
+- **默认预算 200000 token，高于 AI 层的 100000**（`MIN_ADOPTABLE_TOKENS = 150000` 还会拒绝向下采纳）：
+  生产系统提示 181218 字符 ≈ 117k token，100k 阈值下**提示词本身就超预算**，压缩在数学上永远达不标 ——
+  这才是「一个考勤任务压缩 50 次、单调递增到 400093」的真因。默认值低于固定开销会让本模块每回合省略掉
+  全部历史却毫无收益。
+- **固定开销本身治不了**：若 system prompt + tool schema + 本回合两行就超预算，`within_budget=False`
+  **如实上报而不掩盖**（不抛异常），日志点名不可省略下限的四个组成部分。
+
+与 `COMPACTION_COOLDOWN_FRACTION`（上一节）是同一个直觉的两处应用：那个按上游 token 计量、管压缩，
+这个在装配点按字符计量、管省略。
 
 ### peek_pending / clear_pending 安全机制
 

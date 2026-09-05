@@ -34,10 +34,20 @@ mkdir -p "$SUPPORT_ROOT" "$LOG_DIR"
 # and refresh only what the build owns: .env (CI-injected secrets) and the
 # version/update config. Without this an update would silently keep serving the
 # old config out of a stale copy.
+#
+# A failed seed is a broken install -- the Gateway would start against an empty
+# agent package with no diagnostics -- so it is fatal here, with a line in
+# $LOG_DIR/launcher.log rather than a silent `|| true`.
 if [ ! -d "$AGENT_DIR" ]; then
-    mkdir -p "$AGENT_DIR"
+    if ! mkdir -p "$AGENT_DIR" 2>/dev/null; then
+        echo "launcher: ERROR cannot create $AGENT_DIR" >>"$LOG_DIR/launcher.log" 2>/dev/null || true
+        exit 1
+    fi
     # -R rather than rsync: rsync is not guaranteed present on stock macOS 15+.
-    cp -R "$BUNDLE_RESOURCES_DIR/haitun-workspace/." "$AGENT_DIR/" 2>/dev/null || true
+    if ! cp -R "$BUNDLE_RESOURCES_DIR/haitun-workspace/." "$AGENT_DIR/" 2>/dev/null; then
+        echo "launcher: ERROR seeding agent package from bundle to $AGENT_DIR" >>"$LOG_DIR/launcher.log" 2>/dev/null || true
+        exit 1
+    fi
 fi
 for owned in .env haitun-update.conf haitun-version.txt; do
     if [ -f "$BUNDLE_RESOURCES_DIR/haitun-workspace/$owned" ]; then
@@ -85,6 +95,15 @@ ICON_PATH="$BUNDLE_RESOURCES_DIR/haitun.icns"
 # soft-detects a repo checkout or a cwd that looks like an agent package, and
 # the seeded Application Support dir is neither from the process's point of view.
 # --default-workspace matches DEFAULT_USER_WORKSPACE_NAME ("haitun交付").
+#
+# --gateway is likewise explicit because it is **required** (gateway/__init__.py
+# declares it `tyro.MISSING`): which HTTP surfaces to mount is the deployer's
+# call, since mounting one too few fails silently -- some frontend 404s and
+# nothing logs. Omitting it is not a soft default but a tyro exit **2** before
+# the Gateway starts, which is what this launcher hit: the dmg shipped, was
+# signed and notarized, and died the instant it was launched. `desktop` alone
+# matches haitun.c:698 -- the dmg, like the installer, ships only the ToC
+# surface, and adding `feishu` would mount ToB routes no installed user reaches.
 STAMP="$(date +%Y%m%d-%H%M%S)"
 OUT_LOG="$LOG_DIR/$STAMP.out.log"
 ERR_LOG="$LOG_DIR/$STAMP.err.log"
@@ -92,6 +111,7 @@ ERR_LOG="$LOG_DIR/$STAMP.err.log"
 cd "$AGENT_DIR" || exit 1
 
 "$BUNDLE_MACOS_DIR/psi-agent" gateway \
+    --gateway desktop \
     --browser \
     --icon "$ICON_PATH" \
     --verbose \

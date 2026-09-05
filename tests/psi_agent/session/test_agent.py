@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import json
+import re
 import socket as _s
 import textwrap
 from contextlib import aclosing
@@ -10,11 +12,15 @@ from pathlib import Path
 import anyio
 import pytest
 from aiohttp import web
+from loguru import logger
 
+from psi_agent.session import Session
 from psi_agent.session.agent import AgentRun, SessionAgent, current_tool_ai_socket
 from psi_agent.session.ai_client import AiClient
 from psi_agent.session.conversation import Conversation
 from psi_agent.session.protocol import (
+    DEFAULT_MAX_TOOL_ROUNDS,
+    MAX_ROUNDS_NOTICE,
     AgentChunk,
     AgentError,
     AgentRunResult,
@@ -113,14 +119,68 @@ async def test_agent_runs_after_turn_hook_on_stop(tmp_path: Path) -> None:
     mock_server = MockAIServer(tmp_path)
     ai_socket = await mock_server.start(handler)
     user = {"role": "user", "content": "question"}
+    appdata = tmp_path / "appdata"
+    history = appdata / "histories" / "committed.jsonl"
     try:
         agent = SessionAgent(
             ai_client=AiClient(ai_socket),
+            conversation=Conversation(path=history),
             system_prompt=SystemPrompt(after_turn=after_turn),
         )
         _ = [chunk async for chunk in agent.run(user)]
 
-        assert calls == [({**user, "session_id": ""}, {"role": "assistant", "content": "final reply"})]
+        assert calls == [
+            (
+                {
+                    **user,
+                    "session_id": "committed",
+                    "_psi_history_provenance": {
+                        "path": str(history),
+                        "appdata_root": str(appdata),
+                        "user_line": 2,
+                        "assistant_line": 3,
+                    },
+                },
+                {"role": "assistant", "content": "final reply"},
+            )
+        ]
+    finally:
+        await mock_server.cleanup()
+
+
+@pytest.mark.anyio
+async def test_agent_skips_after_turn_hook_when_final_history_commit_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[dict, dict]] = []
+
+    async def after_turn(user_message: dict, assistant_message: dict) -> None:
+        calls.append((user_message, assistant_message))
+
+    async def handler(request: web.Request) -> web.StreamResponse:
+        resp = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream"})
+        await resp.prepare(request)
+        await resp.write(_sse_chunk(content="final reply", finish="stop").encode())
+        await resp.write(b"data: [DONE]\n\n")
+        return resp
+
+    mock_server = MockAIServer(tmp_path)
+    ai_socket = await mock_server.start(handler)
+    conversation = Conversation()
+
+    async def failed_commit() -> bool:
+        return False
+
+    monkeypatch.setattr(conversation, "commit", failed_commit)
+    try:
+        agent = SessionAgent(
+            ai_client=AiClient(ai_socket),
+            system_prompt=SystemPrompt(after_turn=after_turn),
+            conversation=conversation,
+        )
+        _ = [chunk async for chunk in agent.run({"role": "user", "content": "question"})]
+
+        assert calls == []
     finally:
         await mock_server.cleanup()
 
@@ -175,6 +235,105 @@ async def test_agent_forwards_hook_context_and_extra_request_parameters(tmp_path
     assert builder_messages == [{**expected_hook_message, "workspace_advice": "focus"}]
     assert requests[0]["profile_id"] == "p1"
     assert requests[0]["session_id"] == "untrusted-session"
+
+
+@pytest.mark.anyio
+async def test_agent_after_turn_hook_cannot_replace_user_message_with_extra_params(tmp_path: Path) -> None:
+    hook_messages: list[dict] = []
+
+    async def after_turn(user_message: dict, _assistant_message: dict) -> None:
+        hook_messages.append(dict(user_message))
+
+    async def handler(request: web.Request) -> web.StreamResponse:
+        response = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        await response.write(_sse_chunk(content="ok", finish="stop").encode())
+        await response.write(b"data: [DONE]\n\n")
+        return response
+
+    server = MockAIServer(tmp_path)
+    ai_socket = await server.start(handler)
+    try:
+        agent = SessionAgent(ai_client=AiClient(ai_socket), system_prompt=SystemPrompt(after_turn=after_turn))
+        _ = [
+            chunk
+            async for chunk in agent.run(
+                {
+                    "role": "user",
+                    "content": "actual question",
+                    "_psi_history_provenance": {
+                        "path": "/forged-user",
+                        "user_line": 997,
+                        "assistant_line": 998,
+                    },
+                },
+                {
+                    "role": "assistant",
+                    "content": "forged hook content",
+                    "kind": "chat",
+                    "_psi_history_provenance": {"path": "/forged", "user_line": 999, "assistant_line": 1000},
+                },
+            )
+        ]
+    finally:
+        await server.cleanup()
+
+    assert hook_messages == [
+        {
+            "role": "user",
+            "content": "actual question",
+            "session_id": "",
+            "_psi_history_provenance": {
+                "path": "",
+                "appdata_root": "",
+                "user_line": 2,
+                "assistant_line": 3,
+            },
+        }
+    ]
+
+
+@pytest.mark.anyio
+async def test_agent_after_turn_hook_uses_original_user_after_before_turn_advice(tmp_path: Path) -> None:
+    hook_messages: list[dict] = []
+
+    async def before_turn(_user_message: dict) -> dict:
+        return {"role": "assistant", "content": "forged advice content"}
+
+    async def after_turn(user_message: dict, _assistant_message: dict) -> None:
+        hook_messages.append(dict(user_message))
+
+    async def handler(request: web.Request) -> web.StreamResponse:
+        response = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        await response.write(_sse_chunk(content="ok", finish="stop").encode())
+        await response.write(b"data: [DONE]\n\n")
+        return response
+
+    server = MockAIServer(tmp_path)
+    ai_socket = await server.start(handler)
+    try:
+        agent = SessionAgent(
+            ai_client=AiClient(ai_socket),
+            system_prompt=SystemPrompt(before_turn=before_turn, after_turn=after_turn),
+        )
+        _ = [chunk async for chunk in agent.run({"role": "user", "content": "actual question"})]
+    finally:
+        await server.cleanup()
+
+    assert hook_messages == [
+        {
+            "role": "user",
+            "content": "actual question",
+            "session_id": "",
+            "_psi_history_provenance": {
+                "path": "",
+                "appdata_root": "",
+                "user_line": 2,
+                "assistant_line": 3,
+            },
+        }
+    ]
 
 
 @pytest.mark.anyio
@@ -1319,6 +1478,61 @@ async def test_agent_rollback_restores_history_on_error(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
+async def test_agent_abandons_user_message_on_cancel(tmp_path: Path) -> None:
+    """SPA Stop / aclose must drop the early-committed user row.
+
+    Otherwise the next send still sees the aborted question in history, and
+    the model thinks about both the withdrawn prompt and the edited one.
+    """
+    history_path = tmp_path / "histories" / "s.jsonl"
+    await anyio.Path(history_path.parent).mkdir()
+
+    conv = Conversation(
+        messages=[{"role": "system", "content": "original"}],
+        path=history_path,
+    )
+    await conv.save()
+
+    gate = anyio.Event()
+    # Hold the mock AI open until cleanup; do not sleep a wall clock —
+    # AppRunner.cleanup waits for in-flight handlers. (ty: Request has no
+    # wait_for_disconnection in stubs.)
+    hold = anyio.Event()
+
+    async def handler(request: web.Request) -> web.StreamResponse:
+        resp = web.StreamResponse(status=200, reason="OK", headers={"Content-Type": "text/event-stream"})
+        await resp.prepare(request)
+        await resp.write(_sse_chunk(reasoning="thinking about 述职报告").encode())
+        gate.set()
+        await hold.wait()
+        return resp
+
+    mock_server = MockAIServer(tmp_path)
+    ai_socket = await mock_server.start(handler)
+    try:
+        agent = SessionAgent(
+            ai_client=AiClient(ai_socket),
+            tool_registry=ToolRegistry(),
+            conversation=conv,
+        )
+        run = agent.run_streamed({"role": "user", "content": "帮我写述职报告"})
+        async with aclosing(run):
+            async for chunk in run:
+                if chunk.reasoning:
+                    break
+            await gate.wait()
+
+        assert len(agent._conversation.messages) == 1
+        assert agent._conversation.messages[0]["role"] == "system"
+        loaded = await Conversation._load(history_path)
+        assert len(loaded) == 1
+        assert loaded[0]["role"] == "system"
+    finally:
+        hold.set()
+        await mock_server.cleanup()
+
+
+@pytest.mark.anyio
 async def test_agent_rollback_restores_pending_on_error(tmp_path: Path) -> None:
     async def handler(request: web.Request) -> web.StreamResponse:
         return web.Response(status=500)
@@ -1404,12 +1618,33 @@ async def test_agent_saves_on_max_tool_rounds(tmp_path: Path) -> None:
         chunks = [c async for c in agent.run({"role": "user", "content": "hi"})]
 
         content = "".join(c.content or "" for c in chunks)
-        assert "Max tool rounds reached" in content
+        expected = MAX_ROUNDS_NOTICE.format(rounds=1)
+        assert expected in content
+        # The stop must be explicable to the person in the chat, not just to the
+        # log: state the cause and carry the actual round count. A bare marker
+        # would pass a substring check while still reading as a glitch.
+        assert "工具调用上限" in content
+        assert "1 轮" in content
+        assert "Max tool rounds reached" not in content
 
         loaded = await Conversation._load(history_path)
-        assert any(m.get("content") == "[Max tool rounds reached]" for m in loaded)
+        assert any(m.get("content") == expected for m in loaded)
     finally:
         await runner.cleanup()
+
+
+def test_default_max_tool_rounds_is_single_sourced() -> None:
+    """All three entry points must expose the same default.
+
+    They were three separate ``128`` literals, so "change the default" silently
+    meant "change one of three". Pinning the number as well as the agreement
+    keeps a future edit from lowering one copy and leaving the others.
+    """
+    assert DEFAULT_MAX_TOOL_ROUNDS == 20
+    assert Session.__dataclass_fields__["max_tool_rounds"].default == DEFAULT_MAX_TOOL_ROUNDS
+    assert inspect.signature(SessionAgent.__init__).parameters["max_tool_rounds"].default == DEFAULT_MAX_TOOL_ROUNDS
+    assert inspect.signature(SessionAgent.create).parameters["max_tool_rounds"].default == DEFAULT_MAX_TOOL_ROUNDS
+    assert SessionAgent(ai_client=None)._max_tool_rounds == DEFAULT_MAX_TOOL_ROUNDS  # ty: ignore[invalid-argument-type]
 
 
 # --- AgentRunResult: terminal mapping (issue #585) ---
@@ -1419,7 +1654,7 @@ async def _run_streamed_against(
     tmp_path: Path,
     sse_body: bytes,
     *,
-    max_tool_rounds: int = 128,
+    max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS,
     tool: ToolFunction | None = None,
 ) -> AgentRun:
     """Drive one fully-consumed run against a canned SSE body, return the run."""
@@ -1623,3 +1858,228 @@ async def test_legacy_run_still_yields_chunks_without_result(tmp_path: Path) -> 
         assert "".join(c.content or "" for c in chunks) == "hello"
     finally:
         await server.cleanup()
+
+
+# -- tool elapsed time -------------------------------------------------------
+#
+# Tools run **concurrently** in a task group, so "Executing tool" and "Tool
+# result" interleave in the log. Reconstructing one tool's duration by pairing
+# those timestamps folds every other tool's waiting into the number, and the
+# error gets worse the more tools a turn calls at once. The measurement
+# therefore lives in the same function as the measured region.
+
+
+async def _run_one_tool_turn(
+    tmp_path: Path,
+    *,
+    tool_name: str,
+    func,
+    arguments: str = "{}",
+) -> None:
+    """Drive one tool-calling round trip against a mock AI server."""
+    request_count = 0
+
+    async def handler(request: web.Request) -> web.StreamResponse:
+        nonlocal request_count
+        request_count += 1
+        response = web.StreamResponse(status=200, reason="OK", headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        if request_count == 1:
+            call = {
+                "id": "mock",
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": "test",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {"name": tool_name, "arguments": arguments},
+                                }
+                            ]
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+            }
+            await response.write(f"data: {json.dumps(call)}\n\n".encode())
+        else:
+            await response.write(_sse_chunk(content="done", finish="stop").encode())
+        await response.write(b"data: [DONE]\n\n")
+        return response
+
+    tool = ToolFunction.from_callable(func)
+    server = MockAIServer(tmp_path)
+    ai_socket = await server.start(handler)
+    try:
+        agent = SessionAgent(
+            ai_client=AiClient(ai_socket),
+            tool_registry=ToolRegistry(files={"test": FileEntry("", {tool_name: tool}, {tool_name: func})}),
+            conversation=Conversation(path=tmp_path / "h.jsonl"),
+        )
+        _ = [chunk async for chunk in agent.run({"role": "user", "content": "call a tool"})]
+    finally:
+        await server.cleanup()
+
+
+@pytest.mark.anyio
+async def test_tool_result_log_carries_elapsed_ms(tmp_path: Path) -> None:
+    """V1: the duration is a field on the result line, at INFO.
+
+    Production runs INFO, so a DEBUG-only field would be absent exactly when a
+    slow tool is the thing being hunted.
+    """
+    messages: list[str] = []
+    sink_id = logger.add(lambda m: messages.append(m.record["message"]), level="INFO")
+
+    async def slow_tool() -> str:
+        """A tool that takes a measurable amount of time."""
+        await anyio.sleep(0.05)
+        return "ok"
+
+    try:
+        await _run_one_tool_turn(tmp_path, tool_name="slow_tool", func=slow_tool)
+    finally:
+        logger.remove(sink_id)
+
+    results = [m for m in messages if m.startswith("Tool result (")]
+    assert len(results) == 1, messages
+    match = re.search(r"elapsed_ms=(\d+)", results[0])
+    assert match, results[0]
+    # Loose lower bound: the tool sleeps 50ms, so a real measurement cannot be 0.
+    # Deliberately no upper bound — Windows CI schedulers are erratic and a
+    # flaky ceiling would get the assertion deleted rather than fixed.
+    assert int(match.group(1)) >= 40, results[0]
+
+
+@pytest.mark.anyio
+async def test_tool_error_log_carries_elapsed_ms(tmp_path: Path) -> None:
+    """V2: failures need the duration too.
+
+    "hung for 30s then timed out" and "rejected the arguments instantly" are
+    different faults with the same message; only the number separates them.
+    """
+    messages: list[str] = []
+    sink_id = logger.add(lambda m: messages.append(m.record["message"]), level="ERROR")
+
+    async def failing_tool() -> str:
+        """A tool that raises after a measurable delay."""
+        await anyio.sleep(0.05)
+        raise RuntimeError("boom")
+
+    try:
+        await _run_one_tool_turn(tmp_path, tool_name="failing_tool", func=failing_tool)
+    finally:
+        logger.remove(sink_id)
+
+    errors = [m for m in messages if m.startswith("Tool execution error (")]
+    assert len(errors) == 1, messages
+    match = re.search(r"elapsed_ms=(\d+)", errors[0])
+    assert match, errors[0]
+    assert int(match.group(1)) >= 40, errors[0]
+
+
+@pytest.mark.anyio
+async def test_tool_elapsed_excludes_a_concurrent_tools_waiting(tmp_path: Path) -> None:
+    """V3: the number is per tool, not per batch.
+
+    Two tools start together, one sleeping 5x longer. Timestamp pairing would
+    charge the fast tool with the slow one's wait; measuring inside the tool's
+    own coroutine cannot.
+    """
+    messages: list[str] = []
+    sink_id = logger.add(lambda m: messages.append(m.record["message"]), level="INFO")
+
+    async def quick() -> str:
+        """Returns almost immediately."""
+        return "quick"
+
+    async def slow() -> str:
+        """Sleeps long enough to dominate the batch."""
+        await anyio.sleep(0.25)
+        return "slow"
+
+    quick_tool = ToolFunction.from_callable(quick)
+    slow_tool = ToolFunction.from_callable(slow)
+    request_count = 0
+
+    async def handler(request: web.Request) -> web.StreamResponse:
+        nonlocal request_count
+        request_count += 1
+        response = web.StreamResponse(status=200, reason="OK", headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        if request_count == 1:
+            call = {
+                "id": "mock",
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": "test",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "c1",
+                                    "type": "function",
+                                    "function": {"name": "slow", "arguments": "{}"},
+                                },
+                                {
+                                    "index": 1,
+                                    "id": "c2",
+                                    "type": "function",
+                                    "function": {"name": "quick", "arguments": "{}"},
+                                },
+                            ]
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+            }
+            await response.write(f"data: {json.dumps(call)}\n\n".encode())
+        else:
+            await response.write(_sse_chunk(content="done", finish="stop").encode())
+        await response.write(b"data: [DONE]\n\n")
+        return response
+
+    server = MockAIServer(tmp_path)
+    ai_socket = await server.start(handler)
+    try:
+        agent = SessionAgent(
+            ai_client=AiClient(ai_socket),
+            tool_registry=ToolRegistry(
+                files={
+                    "test": FileEntry(
+                        "",
+                        {"slow": slow_tool, "quick": quick_tool},
+                        {"slow": slow, "quick": quick},
+                    )
+                }
+            ),
+            conversation=Conversation(path=tmp_path / "h.jsonl"),
+        )
+        _ = [chunk async for chunk in agent.run({"role": "user", "content": "call two tools"})]
+    finally:
+        await server.cleanup()
+        logger.remove(sink_id)
+
+    # A missing ``elapsed_ms`` is a real regression in the log line, so it must
+    # fail as an assertion naming the offending message rather than as an
+    # ``AttributeError`` on ``None``.
+    elapsed: dict[str, int] = {}
+    for m in messages:
+        if not m.startswith("Tool result ("):
+            continue
+        match = re.search(r"elapsed_ms=(\d+)", m)
+        assert match is not None, f"no elapsed_ms in {m!r}"
+        elapsed[m.split("'")[1]] = int(match.group(1))
+    assert set(elapsed) == {"slow", "quick"}, messages
+    assert elapsed["slow"] >= 200, elapsed
+    # The fast tool must not have inherited the slow one's 250ms wait.
+    assert elapsed["quick"] < 100, elapsed

@@ -22,7 +22,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 MACOS_DIR="$REPO_ROOT/.github/macos"
-WORKSPACE_SRC="$REPO_ROOT/examples/haitun-workspace"
+WORKSPACE_SRC="$REPO_ROOT/agents/feishu"
 ISS_FILE="$REPO_ROOT/.github/inno-setup/haitun.iss"
 OUT_DIR="${OUT_DIR:-$REPO_ROOT/macos-dist}"
 BUILD_DIR="$OUT_DIR/build"
@@ -59,28 +59,28 @@ install -m 755 "$PSI_AGENT_BIN" "$CONTENTS/MacOS/psi-agent"
 install -m 755 "$MACOS_DIR/updater.sh" "$CONTENTS/Resources/updater.sh"
 install -m 755 "$MACOS_DIR/rollback.sh" "$CONTENTS/Resources/rollback.sh"
 
-# ---- icon: haitun.ico -> haitun.icns ----
-# Reuses the Windows icon so both platforms stay visually identical and there is
-# only one icon asset to keep in sync.
+# ---- icon: haitun-1024.png -> haitun.icns ----
+# Source is a committed 1024x1024 PNG generated from the Windows haitun.ico
+# (scripts/gen_haitun_icon_png.py, kept in sync by the CI `--check` step) so
+# both platforms stay visually identical with one source of truth. sips cannot
+# be relied on to read .ico -- it is not in its documented format list -- so
+# the source is a real PNG, and every step below fails the build instead of
+# silently shipping an unrenderable icon.
 log "converting icon"
 ICONSET="$BUILD_DIR/haitun.iconset"
 mkdir -p "$ICONSET"
-ICO_SRC="$REPO_ROOT/.github/inno-setup/haitun.ico"
-PNG_TMP="$BUILD_DIR/haitun-1024.png"
-if sips -s format png "$ICO_SRC" --out "$PNG_TMP" >/dev/null 2>&1; then
-    for size in 16 32 64 128 256 512; do
-        sips -z "$size" "$size" "$PNG_TMP" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null 2>&1 || true
-        double=$((size * 2))
-        sips -z "$double" "$double" "$PNG_TMP" --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null 2>&1 || true
-    done
-    iconutil -c icns "$ICONSET" -o "$CONTENTS/Resources/haitun.icns" 2>/dev/null || true
-fi
-# Fall back to the raw .ico: the Gateway accepts ico for --icon, and a missing
-# icon must not fail the build.
-if [ ! -f "$CONTENTS/Resources/haitun.icns" ]; then
-    log "icns conversion unavailable, shipping .ico as-is"
-    cp "$ICO_SRC" "$CONTENTS/Resources/haitun.icns"
-fi
+PNG_SRC="$MACOS_DIR/haitun-1024.png"
+[ -f "$PNG_SRC" ] || die "icon source missing: $PNG_SRC (regenerate with scripts/gen_haitun_icon_png.py)"
+for size in 16 32 64 128 256 512; do
+    sips -z "$size" "$size" "$PNG_SRC" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null \
+        || die "sips failed to make ${size}px icon"
+    double=$((size * 2))
+    sips -z "$double" "$double" "$PNG_SRC" --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null \
+        || die "sips failed to make ${size}px@2x icon"
+done
+iconutil -c icns "$ICONSET" -o "$CONTENTS/Resources/haitun.icns" \
+    || die "iconutil failed to build haitun.icns"
+[ -s "$CONTENTS/Resources/haitun.icns" ] || die "iconutil produced an empty haitun.icns"
 
 # ---- agent package + runtime config ----
 # Seeded into Resources and copied out to Application Support on first run: a
@@ -559,8 +559,14 @@ if hdiutil attach "$DMG_PATH" -mountpoint "$MNT" -nobrowse -readonly >/dev/null 
     # otherwise outlive it and hold the runner's stdio open.
     smoke "=== direct exec ==="
     EXE_OUT="$BUILD_DIR/smoke-exec.txt"
-    ( "$MAIN_EXE" >"$EXE_OUT" 2>&1 & echo $! >"$BUILD_DIR/smoke.pid" ) || true
-    SMOKE_PID="$(cat "$BUILD_DIR/smoke.pid" 2>/dev/null || echo)"
+    # Backgrounded directly, NOT inside `( ... & echo $! >file )`. That form
+    # recorded the pid of a process belonging to the *subshell*, so out here it
+    # was not our child: `kill -0` still saw it, but `wait` refused it and
+    # returned **127** -- which `set -e` then turned into an abort of this whole
+    # script, before `done:` and before the verdict block below ever ran. The
+    # 127 was the probe's own bookkeeping bug, not a finding about the product.
+    "$MAIN_EXE" >"$EXE_OUT" 2>&1 &
+    SMOKE_PID=$!
 
     # 40s: the launcher seeds a ~600 MB agent tree on first run before the
     # Gateway even starts, and a hosted runner's disk is not fast.
@@ -578,13 +584,28 @@ if hdiutil attach "$DMG_PATH" -mountpoint "$MNT" -nobrowse -readonly >/dev/null 
     if [ "$ALIVE" = "1" ]; then
         smoke "process still alive after 40s (expected: launcher waits on the Gateway)"
         SMOKE_OK=1
-        kill -TERM "-$SMOKE_PID" 2>/dev/null || kill -TERM "$SMOKE_PID" 2>/dev/null || true
+        # The launcher `wait`s on the Gateway it backgrounded, so killing the
+        # launcher alone orphans the Gateway. A negative-pid group kill does
+        # not help: with no job control on a CI shell the backgrounded pair
+        # shares this script's own process group, so `kill -TERM -$PID`
+        # targets a group that does not exist (observed) and the fallback
+        # killed only the launcher. Reap both explicitly instead.
+        kill -TERM "$SMOKE_PID" 2>/dev/null || true
+        wait "$SMOKE_PID" 2>/dev/null || true
+        pkill -f "$APP_NAME.app/Contents/MacOS/psi-agent" 2>/dev/null || true
     else
-        # Exit status is the diagnosis: 126/127 point at exec (bad interpreter,
-        # not executable), >128 is a signal -- 137/SIGKILL is what a hardened
-        # runtime or library-validation rejection looks like from out here.
-        wait "$SMOKE_PID" 2>/dev/null
-        smoke "process exited early, status $?"
+        # Exit status is the diagnosis: 2 is the CLI refusing its arguments
+        # (tyro prints a "Required options" box and never starts the Gateway),
+        # 126/127 point at exec (bad interpreter, not executable), >128 is a
+        # signal -- 137/SIGKILL is what a hardened runtime or library-validation
+        # rejection looks like from out here.
+        #
+        # `|| EXIT_ST=$?` rather than a bare `wait`: a non-zero status here is
+        # the very thing being measured, and under `set -e` a bare `wait` would
+        # abort the script instead of reporting it.
+        EXIT_ST=0
+        wait "$SMOKE_PID" 2>/dev/null || EXIT_ST=$?
+        smoke "process exited early, status $EXIT_ST"
     fi
 
     smoke "=== stdout/stderr ==="
@@ -628,12 +649,23 @@ elif [ "$SMOKE_OK" = "1" ]; then
     log "launch smoke test: exec ok but LaunchServices FAILED -- see smoke.txt"
     log "  this is the \"can't be opened\" class of failure, not a Gatekeeper one"
 else
-    # Not fatal yet: this check is new and its own false-negative modes are not
-    # yet characterised on a hosted runner (no window server, no user session).
-    # Turning it into a hard gate before that is understood would block every
-    # build on the probe rather than on the product.
+    # Now fatal. The earlier note here said this probe's false-negative modes
+    # were "not yet characterised on a hosted runner (no window server, no user
+    # session)" and therefore must not gate. That reasoning applies to `open -a`
+    # -- LaunchServices genuinely needs a GUI session, and the quarantined call
+    # above can only return "undetermined" here -- but it does NOT apply to
+    # SMOKE_OK, which comes from a direct exec(2). That path needs no window
+    # server, no user session and no policy layer: the binary either stays up or
+    # hands back a status. It is fully determined headlessly, so the only thing
+    # keeping it non-fatal was the earlier PID bug making its status unreadable.
+    #
+    # This is why the gate lands on SMOKE_OK alone. LS_OK and QUARANTINE_OK stay
+    # advisory above, because a red there can mean "no GUI session" rather than
+    # "broken product" -- gating on them would block builds on the probe.
     log "launch smoke test: FAILED -- see smoke.txt above"
-    log "  this is the \"can't be opened\" class of failure, not a Gatekeeper one"
+    log "  the app does not stay up under a direct exec; a dmg built from this"
+    log "  would install, pass Gatekeeper, and die on launch"
+    die "launch smoke test failed: the built app does not run"
 fi
 
 log "done: $DMG_PATH"

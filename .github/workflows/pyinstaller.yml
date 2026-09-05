@@ -100,8 +100,9 @@ jobs:
         --onefile
         --name psi-agent
         --distpath pyinstaller-dist
-        --add-data src/psi_agent/gateway/spa/dist:psi_agent/gateway/spa/dist
-        --add-data src/psi_agent/gateway/spa-v2/dist:psi_agent/gateway/spa-v2/dist
+        --add-data src/psi_agent/gateway/desktop/spa/dist:psi_agent/gateway/desktop/spa/dist
+        --add-data src/psi_agent/gateway/desktop/spa-v2/dist:psi_agent/gateway/desktop/spa-v2/dist
+        --add-data src/psi_agent/i18n:psi_agent/i18n
         --collect-submodules any_llm
         --collect-submodules mcp
         --collect-submodules serper_mcp_server
@@ -132,18 +133,22 @@ jobs:
       # 这一步防的是「改了 md 忘了重新生成」—— 那会让安装器与产品内展示过时协议。
       - name: Check legal HTML is in sync with docs
         run: uv run python scripts/gen_legal_html.py --check
+      # macOS 图标源 (haitun-1024.png) 是 Windows ico 的生成物, 同样入库守同步:
+      # 改了 ico 忘了重新生成, dmg 的图标就是旧的。
+      - name: Check macOS icon PNG is in sync with haitun.ico
+        run: uv run python scripts/gen_haitun_icon_png.py --check
       - run: uv pip install pyinstaller "mcp[cli,rich,ws]" "any-llm-sdk[all]"
       - uses: actions/setup-node@v7
         with:
           node-version: "26"
       - run: npm ci
-        working-directory: src/psi_agent/gateway/spa
+        working-directory: src/psi_agent/gateway/desktop/spa
       - run: npm run build
-        working-directory: src/psi_agent/gateway/spa
+        working-directory: src/psi_agent/gateway/desktop/spa
       - run: npm ci
-        working-directory: src/psi_agent/gateway/spa-v2
+        working-directory: src/psi_agent/gateway/desktop/spa-v2
       - run: npm run build
-        working-directory: src/psi_agent/gateway/spa-v2
+        working-directory: src/psi_agent/gateway/desktop/spa-v2
       - shell: bash
         run: uv run pyinstaller $PYINSTALLER_COMMON_FLAGS src/psi_agent/cli.py
       - uses: actions/upload-artifact@v7
@@ -160,6 +165,11 @@ jobs:
   haitun-inno-setup:
     needs: pyinstaller
     runs-on: windows-latest
+    # OIDC is needed only for the trusted release path. The installer job still
+    # runs for PRs and feature branches, but those artifacts remain unsigned.
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
@@ -167,7 +177,7 @@ jobs:
           name: psi-agent-pyinstaller-windows-latest
           path: dist-exe
       - shell: cmd
-        run: copy dist-exe\psi-agent.exe "examples\haitun-workspace\psi-agent.exe"
+        run: copy dist-exe\psi-agent.exe "agents\desktop\psi-agent.exe"
       - uses: msys2/setup-msys2@v2
         id: msys2
         with:
@@ -180,10 +190,10 @@ jobs:
             mingw-w64-ucrt-x86_64-nodejs mingw-w64-ucrt-x86_64-uv
       - shell: pwsh
         run: |
-          robocopy "${{ steps.msys2.outputs.msys2-location }}" "examples\haitun-workspace\msys64" /E /NFL /NDL /NJH /NJS /NP
+          robocopy "${{ steps.msys2.outputs.msys2-location }}" "agents\desktop\msys64" /E /NFL /NDL /NJH /NJS /NP
           if ($LASTEXITCODE -ge 8) { exit 1 } else { exit 0 }
       - shell: pwsh
-        run: Remove-Item -Recurse -Force "examples\haitun-workspace\msys64\var\cache\pacman\pkg\*" -ErrorAction SilentlyContinue
+        run: Remove-Item -Recurse -Force "agents\desktop\msys64\var\cache\pacman\pkg\*" -ErrorAction SilentlyContinue
       - run: choco install innosetup --no-progress
       - name: Build launcher with updater config
         shell: pwsh
@@ -194,14 +204,81 @@ jobs:
           $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
           Import-Module "$vs\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
           Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments "-arch=amd64"
-          & ".github\inno-setup\build-haitun-launcher.ps1"
+          & ".github\inno-setup\build-haitun-launcher.ps1" `
+            -WorkspaceDir (Resolve-Path "agents\desktop")
+      # Keep the Windows path parallel to macOS: sign the executable after it
+      # has been assembled and before it is embedded in the installers. OIDC is
+      # deliberately restricted to main, matching the Azure federated
+      # credential configured for this repository. Manual runs are useful for
+      # an initial HSM test and use the same branch subject.
+      - name: Azure login for Windows code signing
+        if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID || vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID || vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID || vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Download AzureSignTool
+        if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        shell: pwsh
+        run: |
+          $tool = Join-Path $env:RUNNER_TEMP 'AzureSignTool-7.0.1-x64.exe'
+          Invoke-WebRequest `
+            -Uri 'https://github.com/vcsjones/AzureSignTool/releases/download/v7.0.1/AzureSignTool-x64.exe' `
+            -OutFile $tool
+          if (-not (Test-Path -LiteralPath $tool)) {
+            throw 'AzureSignTool download did not produce an executable.'
+          }
+          "AZURE_SIGN_TOOL=$tool" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Sign application executables
+        if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        shell: pwsh
+        env:
+          AZURE_KEY_VAULT_URL: ${{ vars.AZURE_KEY_VAULT_URL || secrets.AZURE_KEY_VAULT_URL }}
+          AZURE_KEY_VAULT_NAME: ${{ vars.AZURE_KEY_VAULT_NAME || secrets.AZURE_KEY_VAULT_NAME }}
+          AZURE_CERTIFICATE_NAME: ${{ vars.AZURE_CERTIFICATE_NAME || vars.AZURE_KEY_VAULT_CERTIFICATE || secrets.AZURE_CERTIFICATE_NAME }}
+          GLOBALSIGN_TSA_URL: ${{ vars.GLOBALSIGN_TSA_URL || secrets.GLOBALSIGN_TSA_URL }}
+        run: |
+          $vaultUrl = ($env:AZURE_KEY_VAULT_URL ?? '').Trim()
+          if ([string]::IsNullOrWhiteSpace($vaultUrl)) {
+            $vaultName = ($env:AZURE_KEY_VAULT_NAME ?? '').Trim()
+            if ([string]::IsNullOrWhiteSpace($vaultName)) {
+              throw 'Set repository Variable AZURE_KEY_VAULT_URL or AZURE_KEY_VAULT_NAME.'
+            }
+            $vaultUrl = "https://$vaultName.vault.azure.net/"
+          }
+          $certificateName = ($env:AZURE_CERTIFICATE_NAME ?? '').Trim()
+          $tsaUrl = ($env:GLOBALSIGN_TSA_URL ?? '').Trim()
+          if ([string]::IsNullOrWhiteSpace($certificateName)) {
+            throw 'Set repository Variable AZURE_CERTIFICATE_NAME.'
+          }
+          if ([string]::IsNullOrWhiteSpace($tsaUrl)) {
+            throw 'Set repository Variable GLOBALSIGN_TSA_URL.'
+          }
+          $files = @(
+            (Resolve-Path 'agents\desktop\psi-agent.exe').Path,
+            (Resolve-Path '.github\inno-setup\haitun.exe').Path
+          )
+          & $env:AZURE_SIGN_TOOL sign `
+            --azure-key-vault-url $vaultUrl `
+            --azure-key-vault-managed-identity `
+            --azure-key-vault-certificate $certificateName `
+            --description 'HaiTun Agent' `
+            --timestamp-rfc3161 $tsaUrl `
+            --timestamp-digest sha256 `
+            --file-digest sha256 `
+            --verbose `
+            $files
+          if ($LASTEXITCODE -ne 0) {
+            throw "AzureSignTool failed for application executables (exit code $LASTEXITCODE)."
+          }
       - name: Inject runtime .env
         shell: pwsh
         env:
           SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
         run: |
           # 只把 key 写进打包目录，不落库；PR 分支没有 secret 时生成空 .env，打包照常成功。
-          $path = "examples\haitun-workspace\.env"
+          $path = "agents\desktop\.env"
           $lines = [System.Collections.Generic.List[string]]::new()
           if ($env:SERPER_API_KEY) {
             $lines.Add("SERPER_API_KEY=$env:SERPER_API_KEY")
@@ -211,21 +288,104 @@ jobs:
       - shell: pwsh
         run: |
           Invoke-WebRequest -Uri "https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/ChineseSimplified.isl" -OutFile ".github\inno-setup\ChineseSimplified.isl"
+          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/ChineseTraditional.isl" -OutFile ".github\inno-setup\ChineseTraditional.isl"
       - name: Build installers
         shell: pwsh
         run: |
+          $sourceIss = ".github\inno-setup\haitun.iss"
+          $desktopIss = ".github\inno-setup\haitun-desktop.iss"
+          $definition = [System.IO.File]::ReadAllText($sourceIss)
+          $definition = $definition.Replace('agents\feishu', 'agents\desktop')
+          if ($definition.Contains('agents\feishu')) {
+            throw 'Desktop installer definition still references agents\feishu.'
+          }
+          [System.IO.File]::WriteAllText(
+            $desktopIss,
+            $definition,
+            [System.Text.UTF8Encoding]::new($false)
+          )
+          $required = @(
+            'agents\desktop\systems\system.py',
+            'agents\desktop\tools\memory_search.py',
+            'agents\desktop\tools\_fusion_memory\runtime.py'
+          )
+          foreach ($path in $required) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "Desktop agent package is incomplete: $path"
+            }
+          }
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-          & $iscc /Qp /O"installer-output" ".github\inno-setup\haitun.iss"
+          & $iscc /Qp /O"installer-output" $desktopIss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $iscc /Qp /DCOMPONENT_APP /O"installer-output" ".github\inno-setup\haitun.iss"
+          & $iscc /Qp /DCOMPONENT_APP /O"installer-output" $desktopIss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $iscc /Qp /DCOMPONENT_MSYS /O"installer-output" ".github\inno-setup\haitun.iss"
+          & $iscc /Qp /DCOMPONENT_MSYS /O"installer-output" $desktopIss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Collect version files
         shell: pwsh
         run: |
-          Copy-Item -Force "examples\haitun-workspace\haitun-version.txt" "installer-output\"
-          Copy-Item -Force "examples\haitun-workspace\msys64\msys-version.txt" "installer-output\"
+          Copy-Item -Force "agents\desktop\haitun-version.txt" "installer-output\"
+          Copy-Item -Force "agents\desktop\msys64\msys-version.txt" "installer-output\"
+      - name: Sign and verify installer executables
+        if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        shell: pwsh
+        env:
+          AZURE_KEY_VAULT_URL: ${{ vars.AZURE_KEY_VAULT_URL || secrets.AZURE_KEY_VAULT_URL }}
+          AZURE_KEY_VAULT_NAME: ${{ vars.AZURE_KEY_VAULT_NAME || secrets.AZURE_KEY_VAULT_NAME }}
+          AZURE_CERTIFICATE_NAME: ${{ vars.AZURE_CERTIFICATE_NAME || vars.AZURE_KEY_VAULT_CERTIFICATE || secrets.AZURE_CERTIFICATE_NAME }}
+          GLOBALSIGN_TSA_URL: ${{ vars.GLOBALSIGN_TSA_URL || secrets.GLOBALSIGN_TSA_URL }}
+        run: |
+          $vaultUrl = ($env:AZURE_KEY_VAULT_URL ?? '').Trim()
+          if ([string]::IsNullOrWhiteSpace($vaultUrl)) {
+            $vaultName = ($env:AZURE_KEY_VAULT_NAME ?? '').Trim()
+            if ([string]::IsNullOrWhiteSpace($vaultName)) {
+              throw 'Set repository Variable AZURE_KEY_VAULT_URL or AZURE_KEY_VAULT_NAME.'
+            }
+            $vaultUrl = "https://$vaultName.vault.azure.net/"
+          }
+          $certificateName = ($env:AZURE_CERTIFICATE_NAME ?? '').Trim()
+          $tsaUrl = ($env:GLOBALSIGN_TSA_URL ?? '').Trim()
+          if ([string]::IsNullOrWhiteSpace($certificateName)) {
+            throw 'Set repository Variable AZURE_CERTIFICATE_NAME.'
+          }
+          if ([string]::IsNullOrWhiteSpace($tsaUrl)) {
+            throw 'Set repository Variable GLOBALSIGN_TSA_URL.'
+          }
+          $files = @(Get-ChildItem -LiteralPath 'installer-output' -Filter '*.exe' -File |
+            ForEach-Object { $_.FullName } | Sort-Object)
+          if ($files.Count -ne 3) {
+            throw "Expected three installer executables, found $($files.Count)."
+          }
+          & $env:AZURE_SIGN_TOOL sign `
+            --azure-key-vault-url $vaultUrl `
+            --azure-key-vault-managed-identity `
+            --azure-key-vault-certificate $certificateName `
+            --description 'HaiTun Agent installer' `
+            --timestamp-rfc3161 $tsaUrl `
+            --timestamp-digest sha256 `
+            --file-digest sha256 `
+            --verbose `
+            $files
+          if ($LASTEXITCODE -ne 0) {
+            throw "AzureSignTool failed for installer executables (exit code $LASTEXITCODE)."
+          }
+          $signtool = Get-ChildItem `
+            -LiteralPath "${env:ProgramFiles(x86)}\Windows Kits\10\bin" `
+            -Filter 'signtool.exe' -File -Recurse -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if ($null -eq $signtool) {
+            throw 'Windows SDK signtool.exe was not found for signature verification.'
+          }
+          $applicationFiles = @(
+            (Resolve-Path 'agents\desktop\psi-agent.exe').Path,
+            (Resolve-Path '.github\inno-setup\haitun.exe').Path
+          )
+          foreach ($file in ($applicationFiles + $files)) {
+            & $signtool.FullName verify /pa /all /v $file
+            if ($LASTEXITCODE -ne 0) {
+              throw "signtool verification failed for $file (exit code $LASTEXITCODE)."
+            }
+          }
       - uses: actions/upload-artifact@v7
         with:
           name: haitun-agent-installers
@@ -254,9 +414,9 @@ jobs:
           # 与 Windows 侧同一套做法: 只写进打包目录, 不落库; PR 分支没有 secret
           # 时生成空 .env, 打包照常成功。
           if [ -n "$SERPER_API_KEY" ]; then
-            printf 'SERPER_API_KEY=%s\n' "$SERPER_API_KEY" > examples/haitun-workspace/.env
+            printf 'SERPER_API_KEY=%s\n' "$SERPER_API_KEY" > agents/desktop/.env
           else
-            : > examples/haitun-workspace/.env
+            : > agents/desktop/.env
           fi
           echo "runtime .env prepared (SERPER_API_KEY present: ${SERPER_API_KEY:+yes})"
       # 公证默认全开, 特性分支和 PR 也公证。
@@ -313,8 +473,61 @@ jobs:
           APP_SPECIFIC_PASSWORD: ${{ secrets.APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
+          desktop_launcher=.github/macos/launcher-desktop.sh
+          awk '
+            BEGIN { inserted = 0 }
+            $0 == "if [ ! -d \"$AGENT_DIR\" ]; then" && !inserted {
+              print "# PyInstaller desktop migration: preserve the former Feishu package, then reseed."
+              print "if [ -d \"$AGENT_DIR\" ] &&"
+              print "   [ -f \"$AGENT_DIR/tools/_fusion_memory_mcp.py\" ] &&"
+              print "   [ ! -f \"$AGENT_DIR/tools/_fusion_memory/runtime.py\" ]; then"
+              print "    legacy=\"$SUPPORT_ROOT/agent.pre-desktop\""
+              print "    suffix=0"
+              print "    while [ -e \"$legacy\" ]; do"
+              print "        suffix=$((suffix + 1))"
+              print "        legacy=\"$SUPPORT_ROOT/agent.pre-desktop.$suffix\""
+              print "    done"
+              print "    if ! mv \"$AGENT_DIR\" \"$legacy\"; then"
+              print "        echo \"launcher: ERROR cannot preserve legacy agent package\" >>\"$LOG_DIR/launcher.log\" 2>/dev/null || true"
+              print "        exit 1"
+              print "    fi"
+              print "    echo \"launcher: preserved legacy agent package at $legacy\" >>\"$LOG_DIR/launcher.log\" 2>/dev/null || true"
+              print "fi"
+              inserted = 1
+            }
+            { print }
+            END { if (!inserted) exit 42 }
+          ' .github/macos/launcher.sh > "$desktop_launcher"
+
+          desktop_build=.github/macos/build-dmg-desktop.sh
+          sed \
+            -e 's|WORKSPACE_SRC="$REPO_ROOT/agents/feishu"|WORKSPACE_SRC="$REPO_ROOT/agents/desktop"|' \
+            -e 's|"$MACOS_DIR/launcher.sh"|"$MACOS_DIR/launcher-desktop.sh"|' \
+            .github/macos/build-dmg.sh > "$desktop_build"
+          if ! grep -Fq 'WORKSPACE_SRC="$REPO_ROOT/agents/desktop"' "$desktop_build"; then
+            echo "::error::Desktop dmg builder does not select agents/desktop"
+            exit 1
+          fi
+          if ! grep -Fq '"$MACOS_DIR/launcher-desktop.sh"' "$desktop_build"; then
+            echo "::error::Desktop dmg builder does not select the migration launcher"
+            exit 1
+          fi
+          if ! grep -Fq 'agent.pre-desktop' "$desktop_launcher"; then
+            echo "::error::Desktop launcher does not preserve the legacy Feishu agent"
+            exit 1
+          fi
+          for path in \
+            agents/desktop/systems/system.py \
+            agents/desktop/tools/memory_search.py \
+            agents/desktop/tools/_fusion_memory/runtime.py; do
+            if [ ! -f "$path" ]; then
+              echo "::error::Desktop agent package is incomplete: $path"
+              exit 1
+            fi
+          done
+          bash -n "$desktop_launcher" "$desktop_build"
           chmod +x dist-bin/psi-agent
-          bash .github/macos/build-dmg.sh
+          bash "$desktop_build"
       # 只放 dmg。这个 artifact 是「给人下载去装的东西」, 从 Actions 页面下下来解开
       # 应该就是一个安装包, 不该再多一个文件让人猜它是不是要一起拷走。
       # `haitun-version.txt` 是发布流水线的元数据 (oss-publish 用它核对两平台版本
@@ -325,8 +538,9 @@ jobs:
           path: macos-dist/HaiTun_Agent.dmg
       # 版本号元数据单独一个 artifact, 只给 oss-publish.yml 消费。
       #
-      # 不设 `if: always()`: 版本文件由 build-dmg.sh 在成功路径上写出, 构建挂了就
-      # 该缺席 —— oss-publish 那边下载失败会让整条 publish 红, 这正是要的效果
+      # 不设 `if: always()`: build-dmg.sh 在打包早期就会写出版本文件, 但只有整个
+      # Build dmg step 成功这个 artifact 才会上传 —— 构建挂了 (如 smoke 硬闸) 它
+      # 就缺席, oss-publish 那边下载失败会让整条 publish 红, 这正是要的效果
       # (见 oss-publish.yml 里"两平台共用版本文件"那段注释)。
       - uses: actions/upload-artifact@v7
         with:

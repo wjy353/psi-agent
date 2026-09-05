@@ -297,17 +297,18 @@ async def _forward_chat_completion(request: web.Request, body: dict[str, Any]) -
         # 累积最后一个 chunk 的真实 usage（include_usage=True 时 usage 在末块）
         final_usage = None
         async for chunk in stream:
-            if chunk.usage is not None:
-                final_usage = chunk.usage
-            if max_context_tokens > 0 and chunk.usage and chunk.usage.prompt_tokens > max_context_tokens:
+            usage = getattr(chunk, "usage", None)
+            if usage is not None:
+                final_usage = usage
+            if max_context_tokens > 0 and usage and usage.prompt_tokens > max_context_tokens:
                 compaction_needed = True
                 compaction_usage = {
-                    "prompt_tokens": chunk.usage.prompt_tokens,
-                    "completion_tokens": chunk.usage.completion_tokens,
-                    "total_tokens": chunk.usage.total_tokens,
+                    "prompt_tokens": usage.prompt_tokens,
+                    "completion_tokens": usage.completion_tokens,
+                    "total_tokens": usage.total_tokens,
                 }
                 logger.debug(
-                    f"Compaction needed: prompt_tokens={chunk.usage.prompt_tokens} > threshold={max_context_tokens}"
+                    f"Compaction needed: prompt_tokens={usage.prompt_tokens} > threshold={max_context_tokens}"
                 )
             data = chunk.model_dump_json()
             logger.debug(f"delta keys: {_describe_delta(data)}")

@@ -273,6 +273,7 @@ async def _forward_chat_completion(request: web.Request, body: dict[str, Any]) -
     upstream_error = False
     client_gone = False
     compaction_needed = False
+    final_usage = None
     stream: AsyncIterator[ChatCompletionChunk] | None = None
     try:
         stream = cast(
@@ -294,8 +295,6 @@ async def _forward_chat_completion(request: web.Request, body: dict[str, Any]) -
         logger.debug("Starting to consume upstream SSE stream")
         max_context_tokens: int = request.app.get("max_context_tokens", 0)
         compaction_usage: dict[str, int] = {}
-        # 累积最后一个 chunk 的真实 usage（include_usage=True 时 usage 在末块）
-        final_usage = None
         async for chunk in stream:
             usage = getattr(chunk, "usage", None)
             if usage is not None:

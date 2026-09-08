@@ -83,6 +83,14 @@ TMPFIX_M2_CORE_TOOLS = frozenset(
         "describe_image",
         "read_document",
         "read_pdf",
+        # benchmark-baseline workspace tools (TB/GAIA/Tau2) - always expose
+        "background_list",
+        "background_start",
+        "background_stop",
+        "search",
+        "diff",
+        "artifact_validate",
+        "skill_load",
         "write_word",
         "write_word_from_markdown",
         "session_keyword_search",
@@ -115,13 +123,24 @@ TMPFIX_M2_CORE_TOOLS = frozenset(
 )
 
 
+# Registries this small are always fully exposed (benchmark/workspace packs,
+# ~14 tools today). Only large production packs get trimmed to the allowlist,
+# so every workspace tool stays visible to the model on any future eval.
+TMPFIX_M2_NO_TRIM_MAX_TOOLS = 32
+
 def tmpfix_m2_gate(tools: Mapping[str, _ToolLike]) -> dict[str, _ToolLike]:
     """Narrow a registry to the M2 core set, leaving dispatch untouched.
+
+    Small registries (benchmark/workspace packs, <= TMPFIX_M2_NO_TRIM_MAX_TOOLS)
+    are always returned in full so every workspace tool stays visible to the
+    model; only large production packs get trimmed to TMPFIX_M2_CORE_TOOLS.
 
     Returns the registry unchanged when no core tool is present at all — that
     is the async-load window where the registry is still filling, and gating it
     there would freeze a Session onto a near-empty array.
     """
+    if len(tools) <= TMPFIX_M2_NO_TRIM_MAX_TOOLS:
+        return dict(tools)
     kept = {name: tool for name, tool in tools.items() if name in TMPFIX_M2_CORE_TOOLS}
     return kept or dict(tools)
 

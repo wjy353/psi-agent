@@ -367,3 +367,51 @@ async def test_repeated_identical_search_is_refused_with_its_own_notice(tmp_path
     notices = [c for req in requests for c in _tool_contents(req) if "未执行" in c]
     assert notices, "no repeat notice reached the model"
     assert "相同参数不会得到不同结果" in notices[0]
+
+
+def test_s2_fires_on_unchanged_cycle() -> None:
+    conv = ToolCallConvergence()
+    for name, args, result in [("A", {"q": "x"}, "r1"), ("B", {"q": "y"}, "r2")] * 3:
+        conv.record(name, args, result)
+    assert "S2" in conv.stall_signals()
+
+
+def test_s2_does_not_fire_when_results_change() -> None:
+    conv = ToolCallConvergence()
+    for name, args, result in [
+        ("A", {"q": "x"}, "r1a"), ("B", {"q": "y"}, "r2a"),
+        ("A", {"q": "x"}, "r1b"), ("B", {"q": "y"}, "r2b"),
+        ("A", {"q": "x"}, "r1c"), ("B", {"q": "y"}, "r2c"),
+    ]:
+        conv.record(name, args, result)
+    assert "S2" not in conv.stall_signals()
+
+
+def test_s2_does_not_fire_on_single_tool_repeat() -> None:
+    conv = ToolCallConvergence()
+    for _ in range(9):
+        conv.record("A", {"q": "x"}, "r1")
+    assert "S2" not in conv.stall_signals()
+
+
+def test_s3_fires_when_window_has_no_new_triple() -> None:
+    conv = ToolCallConvergence()
+    for i in range(10):
+        conv.record("bash", {"cmd": f"c{i}"}, f"res{i}")
+    for i in range(6):
+        conv.record("bash", {"cmd": f"c{i}"}, f"res{i}")
+    assert "S3" in conv.stall_signals()
+
+
+def test_s3_does_not_fire_with_fresh_triples() -> None:
+    conv = ToolCallConvergence()
+    for i in range(20):
+        conv.record("bash", {"cmd": f"n{i}"}, f"r{i}")
+    assert "S3" not in conv.stall_signals()
+
+
+def test_checkpoint_rate_limited_per_signal() -> None:
+    conv = ToolCallConvergence()
+    assert conv.should_checkpoint("S3") is True
+    assert conv.should_checkpoint("S3") is False
+

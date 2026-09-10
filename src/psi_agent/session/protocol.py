@@ -34,6 +34,7 @@ __all__ = [
     "S2_CYCLE_MIN_REPEATS",
     "S2_CYCLE_MAX_LENGTH",
     "S3_WINDOW_ROUNDS",
+    "DEFAULT_CHECKPOINT_TURNS",
     "STALL_CHECKPOINT",
     "SOFT_LIMIT_CHECKPOINT",
     "FINISH_REASON_COMPACTION_NEEDED",
@@ -93,15 +94,27 @@ S3 fires when the last ``S3_WINDOW_ROUNDS`` executed tool calls produced no
 ``(tool_name, normalized_args, result_signature)`` triple that had not already
 been seen before the window opened."""
 
+DEFAULT_CHECKPOINT_TURNS = (32, 64, 96, 112, 120)
+"""Model-round numbers in the *normal* window that get a deterministic
+progress self-audit.  Injected into that round as a trailing message only,
+never into history, so the model is steered toward convergence early
+instead of first being asked at the soft limit.
+"""
+"""Sliding window (in model rounds) for S3 execution-novelty detection.
+
+S3 fires when the last ``S3_WINDOW_ROUNDS`` executed tool calls produced no
+``(tool_name, normalized_args, result_signature)`` triple that had not already
+been seen before the window opened."""
+
 STALL_CHECKPOINT = (
     "【进度自检】检测到你可能在空转（重复动作 / 循环 / 连续无新执行状态）。"
     "请先逐行回答，不要继续调工具：\n"
     "1. 主指标：当前值 / 目标值 / 历史最好值？\n"
-    "2. 完成计数：已完成 / 总数 / 当前阻塞项？\n"
-    "3. 最近 3 轮是新增信息，还是重复？\n"
-    "4. 当前动作是否直接对应验收判据？\n"
-    "5. 是否被自建检查器错误地阻挡了必需动作？\n"
-    "6. 下一步：换策略 / 缩小范围 / 收尾？"
+    "2. 你的主指标口径是官方判分口径，还是自己的 micro-benchmark？\n"
+    "3. 最近 3 轮主指标本身改善了吗（而不是「我做了新动作」）？\n"
+    "4. 你现在做的是冲主指标，还是修非验收的边缘？\n"
+    "5. 完成计数：已完成 / 总数 / 当前阻塞项？\n"
+    "6. 下一步：冲指标 / 换策略 / 收尾？"
 )
 
 SOFT_LIMIT_CHECKPOINT = (

@@ -1640,7 +1640,7 @@ def test_default_max_tool_rounds_is_single_sourced() -> None:
     meant "change one of three". Pinning the number as well as the agreement
     keeps a future edit from lowering one copy and leaving the others.
     """
-    assert DEFAULT_MAX_TOOL_ROUNDS == 20
+    assert DEFAULT_MAX_TOOL_ROUNDS == 160
     assert Session.__dataclass_fields__["max_tool_rounds"].default == DEFAULT_MAX_TOOL_ROUNDS
     assert inspect.signature(SessionAgent.__init__).parameters["max_tool_rounds"].default == DEFAULT_MAX_TOOL_ROUNDS
     assert inspect.signature(SessionAgent.create).parameters["max_tool_rounds"].default == DEFAULT_MAX_TOOL_ROUNDS

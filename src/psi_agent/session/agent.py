@@ -46,6 +46,7 @@ from psi_agent.session.history_display import (
 from psi_agent.session.prompt_budget import log_tool_schema_size
 from psi_agent.session.protocol import (
     DEFAULT_MAX_TOOL_ROUNDS,
+    DEFAULT_CHECKPOINT_TURNS,
     DEFAULT_SOFT_TOOL_ROUNDS,
     SOFT_LIMIT_CHECKPOINT,
     STALL_CHECKPOINT,
@@ -780,6 +781,8 @@ class SessionAgent:
                         model_turns = _round + 1
                         if model_turns == self._soft_tool_rounds:
                             pending_checkpoint = SOFT_LIMIT_CHECKPOINT.format(rounds=self._soft_tool_rounds)
+                        elif model_turns in DEFAULT_CHECKPOINT_TURNS:
+                            pending_checkpoint = STALL_CHECKPOINT
 
                         # Frozen after the first non-empty assembly: a tool that shows
                         # up mid-Session would otherwise rewrite this array and
@@ -807,14 +810,9 @@ class SessionAgent:
                         )
                         request_body = assembled.body
                         if pending_checkpoint is not None:
-                            _ckpt = pending_checkpoint
-                            for _m in request_body["messages"]:
-                                if _m.get("role") == "system":
-                                    _base = _m.get("content")
-                                    _m["content"] = (_base + "\n\n" + _ckpt) if _base else _ckpt
-                                    break
-                            else:
-                                request_body["messages"].insert(0, {"role": "system", "content": _ckpt})
+                            # 末尾独立一条（生成前最后看到），带醒目前缀，最高 recency 注意力；
+                            # 不写历史、不污染 system prompt。
+                            request_body["messages"].append({"role": "user", "content": pending_checkpoint})
                             pending_checkpoint = None
                         ai_messages = assembled.body["messages"]
                         _sent_chars = assembled.chars

@@ -35,11 +35,18 @@ module's.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from typing import Any
 
 from loguru import logger
+
+from psi_agent.session.protocol import (
+    S2_CYCLE_MAX_LENGTH,
+    S2_CYCLE_MIN_REPEATS,
+    S3_WINDOW_ROUNDS,
+)
 
 UNPRODUCTIVE_LIMIT = 4
 """Consecutive empty / failed results from one tool before its next call is refused.
@@ -207,6 +214,11 @@ class ToolCallConvergence:
     repeat_limit: int = REPEAT_LIMIT
     _unproductive: dict[str, int] = field(default_factory=dict)
     _attempts: dict[tuple[str, str], int] = field(default_factory=dict)
+    s2_cycle_min_repeats: int = S2_CYCLE_MIN_REPEATS
+    s2_cycle_max_length: int = S2_CYCLE_MAX_LENGTH
+    s3_window_rounds: int = S3_WINDOW_ROUNDS
+    _history: list[tuple[str, str, str]] = field(default_factory=list)
+    _injected: set[str] = field(default_factory=set)
 
     def refusal_for(self, name: str, args: dict[str, Any]) -> str | None:
         """The notice to return instead of dispatching, or ``None`` to dispatch.
@@ -252,6 +264,7 @@ class ToolCallConvergence:
             # the futility streak is over.  The counter measures a *streak*, not
             # lifetime volume -- lifetime volume is bounded by max_tool_rounds.
             self._unproductive.pop(name, None)
+        self._history.append((name, _args_key(args), _result_signature(result)))
 
 
     def stall_signals(self) -> tuple[str, ...]:

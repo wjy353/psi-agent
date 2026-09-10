@@ -14,7 +14,7 @@ from psi_agent.channel._types import ReasoningChunk, TextChunk
 async def run_cli(*, session_socket: str, message: str) -> None:
     if message == "-":
         message = await anyio.to_thread.run_sync(sys.stdin.read, abandon_on_cancel=True)  # ty: ignore
-    console = Console(highlight=False)
+    console = Console(highlight=False, markup=False)
     logger.info(f"Connecting to session at {session_socket}")
 
     try:
@@ -29,7 +29,7 @@ async def run_cli(*, session_socket: str, message: str) -> None:
                     console.print(chunk.text, end="")
     except Exception as e:
         logger.error(f"CLI error: {e!r}")
-        console.print(f"[red]Error: {e}[/red]")
+        console.print("Error:", e, style="red")
         raise
 
     console.print()

@@ -18,7 +18,7 @@ from psi_agent.session.history_display import (
     strip_transfer_markers,
     wire_role,
 )
-from psi_agent.session.protocol import DEFAULT_MAX_TOOL_ROUNDS
+from psi_agent.session.protocol import DEFAULT_MAX_TOOL_ROUNDS, DEFAULT_SOFT_TOOL_ROUNDS
 from psi_agent.session.schedule_registry import ACTIVATE_ALL
 from psi_agent.session.server import serve_session
 
@@ -71,10 +71,9 @@ class Session:
     deactive_schedules: str = ""
     """Schedule names excluded from the above, comma-separated; wins over it."""
 
-    # Ceiling on agent-loop rounds per turn. Rationale for the value (and why
-    # hitting it must be visible to the user) lives on DEFAULT_MAX_TOOL_ROUNDS
-    # in session/protocol.py — kept there so all three entry points cite one
-    # source instead of three drifting literals.
+    # Round budget: the soft limit starts progress checkpoints; the hard limit
+    # stops unconditionally. Rationale lives in session/protocol.py.
+    soft_tool_rounds: int = DEFAULT_SOFT_TOOL_ROUNDS
     max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS
     session_id: str | None = None
     verbose: bool = False
@@ -105,6 +104,7 @@ class Session:
             workspace_path=workspace_path,
             agent_path=agent_path,
             appdata_root=appdata_root,
+            soft_tool_rounds=self.soft_tool_rounds,
             max_tool_rounds=self.max_tool_rounds,
             session_id=self.session_id,
             active_schedules=active,

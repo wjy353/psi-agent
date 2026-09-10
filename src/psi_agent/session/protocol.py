@@ -30,6 +30,12 @@ from psi_agent.protocol import (
 
 __all__ = [
     "DEFAULT_MAX_TOOL_ROUNDS",
+    "DEFAULT_SOFT_TOOL_ROUNDS",
+    "S2_CYCLE_MIN_REPEATS",
+    "S2_CYCLE_MAX_LENGTH",
+    "S3_WINDOW_ROUNDS",
+    "STALL_CHECKPOINT",
+    "SOFT_LIMIT_CHECKPOINT",
     "FINISH_REASON_COMPACTION_NEEDED",
     "FINISH_REASON_ERROR",
     "FINISH_REASON_STOP",
@@ -52,27 +58,57 @@ __all__ = [
 ]
 
 
-DEFAULT_MAX_TOOL_ROUNDS = 128
-"""Default ceiling on agent-loop rounds per turn.
+DEFAULT_SOFT_TOOL_ROUNDS = 128
+"""Soft round ceiling: where the runtime starts asking the model to self-audit.
 
-Measured against real traffic rather than guessed: rounds per turn came out at
-p50=3, p90=13, max=49.  The previous default of 128 sat so far above the
-distribution that it could never be reached — a runaway loop burned 128 model
-calls before stopping, so in practice there was no ceiling at all.  20 sits above
-p90 and leaves normal turns untouched while capping a runaway at roughly a sixth
-of the old cost.
-
-It does *not* sit above the observed max, and that is deliberate: a 49-round turn
-is the shape this limit exists to stop.  Hitting the limit therefore moves from
-"never" to "occasionally", which is why the stop is reported explicitly to the
-user (``MAX_ROUNDS_NOTICE``) instead of just to the log.  Callers that legitimately
-need more rounds should pass ``max_tool_rounds`` explicitly.
-
-Single source of truth for all three entry points (``Session``,
-``SessionAgent.__init__``, ``SessionAgent.create``) — they drifted as separate
-literals before, so changing "the default" meant finding every copy.
+At this round the loop appends a progress checkpoint to the next model request.
+The model should continue only when it can name a concrete primary-metric
+improvement or a completion-counter increase against its first-deliverable
+contract; otherwise it should finalize the best judgeable state.  The soft
+limit is *not* a hard stop — it opens a bounded extension window up to
+``DEFAULT_MAX_TOOL_ROUNDS``.
 """
 
+DEFAULT_MAX_TOOL_ROUNDS = 160
+"""Hard ceiling on agent-loop rounds per turn.  Unconditional stop.
+
+The 32 rounds between soft and hard are a bounded extension for long tasks that
+still show measurable progress, not a license to repeat the same work.  Both
+limits count *model rounds* (one AI request per round, possibly several tool
+calls).  Single source of truth for ``Session``, ``SessionAgent.__init__`` and
+``SessionAgent.create``.
+"""
+
+S2_CYCLE_MIN_REPEATS = 3
+"""How many times a tool-name cycle must repeat (with unchanged result
+signatures) before it counts as an S2 loop."""
+
+S2_CYCLE_MAX_LENGTH = 4
+"""Longest tool-name cycle the S2 detector considers, in tools."""
+
+S3_WINDOW_ROUNDS = 6
+"""Sliding window (in model rounds) for S3 execution-novelty detection.
+
+S3 fires when the last ``S3_WINDOW_ROUNDS`` executed tool calls produced no
+``(tool_name, normalized_args, result_signature)`` triple that had not already
+been seen before the window opened."""
+
+STALL_CHECKPOINT = (
+    "【进度自检】检测到你可能在空转（重复动作 / 循环 / 连续无新执行状态）。"
+    "请先逐行回答，不要继续调工具：\n"
+    "1. 主指标：当前值 / 目标值 / 历史最好值？\n"
+    "2. 完成计数：已完成 / 总数 / 当前阻塞项？\n"
+    "3. 最近 3 轮是新增信息，还是重复？\n"
+    "4. 当前动作是否直接对应验收判据？\n"
+    "5. 是否被自建检查器错误地阻挡了必需动作？\n"
+    "6. 下一步：换策略 / 缩小范围 / 收尾？"
+)
+
+SOFT_LIMIT_CHECKPOINT = (
+    "【软上限自检】已经跑了 {rounds} 轮。"
+    "只有当你能量化说出「主指标改善」或「完成计数增加」时才继续；"
+    "否则立即收尾，交付当前最好的成果。"
+)
 MAX_ROUNDS_NOTICE = (
     "\n\n[已达到单轮工具调用上限, 停在这里]"
     "我连续调用了 {rounds} 轮工具还没得出结论, 先停下来避免空转。"

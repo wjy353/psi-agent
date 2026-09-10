@@ -46,6 +46,9 @@ from psi_agent.session.history_display import (
 from psi_agent.session.prompt_budget import log_tool_schema_size
 from psi_agent.session.protocol import (
     DEFAULT_MAX_TOOL_ROUNDS,
+    DEFAULT_SOFT_TOOL_ROUNDS,
+    SOFT_LIMIT_CHECKPOINT,
+    STALL_CHECKPOINT,
     MAX_ROUNDS_NOTICE,
     AgentChunk,
     AgentError,
@@ -269,6 +272,7 @@ class SessionAgent:
         trigger_registry: TriggerRegistry | None = None,
         system_prompt: SystemPrompt | None = None,
         max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS,
+        soft_tool_rounds: int = DEFAULT_SOFT_TOOL_ROUNDS,
         workspace_path: Path | None = None,
         agent_path: Path | None = None,
         max_context_tokens: int = -1,
@@ -282,6 +286,7 @@ class SessionAgent:
         self._trigger_registry = trigger_registry or TriggerRegistry()
         self._system_prompt = system_prompt or SystemPrompt()
         self._max_tool_rounds = max_tool_rounds
+        self._soft_tool_rounds = soft_tool_rounds
         self._lock = anyio.Lock()
         self._workspace_path = workspace_path
         self._agent_path = agent_path
@@ -331,6 +336,7 @@ class SessionAgent:
         ai_socket: str,
         workspace_path: Path,
         max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS,
+        soft_tool_rounds: int = DEFAULT_SOFT_TOOL_ROUNDS,
         session_id: str | None = None,
         agent_path: Path | None = None,
         appdata_root: str = "",
@@ -386,6 +392,7 @@ class SessionAgent:
             trigger_registry=trigger_registry,
             system_prompt=system_prompt,
             max_tool_rounds=max_tool_rounds,
+            soft_tool_rounds=soft_tool_rounds,
             workspace_path=workspace_path,
             agent_path=agent_root,
         )
@@ -767,9 +774,12 @@ class SessionAgent:
                     # One tracker per turn, so a refusal earned by this question is
                     # never inherited by the next one (``tool_convergence``).
                     convergence = ToolCallConvergence()
+                    pending_checkpoint: str | None = None
                     for _round in range(self._max_tool_rounds):
                         logger.debug(f"Agent loop round {_round + 1}/{self._max_tool_rounds}")
                         model_turns = _round + 1
+                        if model_turns == self._soft_tool_rounds:
+                            pending_checkpoint = SOFT_LIMIT_CHECKPOINT.format(rounds=self._soft_tool_rounds)
 
                         # Frozen after the first non-empty assembly: a tool that shows
                         # up mid-Session would otherwise rewrite this array and
@@ -796,6 +806,16 @@ class SessionAgent:
                             extra,
                         )
                         request_body = assembled.body
+                        if pending_checkpoint is not None:
+                            _ckpt = pending_checkpoint
+                            for _m in request_body["messages"]:
+                                if _m.get("role") == "system":
+                                    _base = _m.get("content")
+                                    _m["content"] = (_base + "\n\n" + _ckpt) if _base else _ckpt
+                                    break
+                            else:
+                                request_body["messages"].insert(0, {"role": "system", "content": _ckpt})
+                            pending_checkpoint = None
                         ai_messages = assembled.body["messages"]
                         _sent_chars = assembled.chars
 
@@ -978,6 +998,10 @@ class SessionAgent:
 
                                     for i, func_name, args in executed:
                                         convergence.record(func_name, args, results[i])
+                                    for _signal in convergence.stall_signals():
+                                        if convergence.should_checkpoint(_signal):
+                                            pending_checkpoint = STALL_CHECKPOINT
+                                            logger.warning(f"Stall signal {_signal}, queueing progress checkpoint")
 
                                     # yield results in order, save
                                     for i, tc, func_name, _args, _argument_error in tool_args:

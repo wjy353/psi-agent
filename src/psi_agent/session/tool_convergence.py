@@ -140,6 +140,17 @@ def _args_key(args: dict[str, Any]) -> str:
         return repr(sorted(args.items(), key=lambda kv: kv[0]))
 
 
+def _result_signature(result: str) -> str:
+    """Stable short identity for a tool result: length + first bytes of sha1.
+
+    S3 compares execution states, not full payloads.  Hashing keeps the ledger
+    small while still distinguishing the same empty result from a new one.
+    """
+    payload = result.encode("utf-8", "replace")
+    digest = hashlib.sha1(payload).hexdigest()
+    return f"{len(payload)}:{digest[:16]}"
+
+
 def is_refusal_notice(result: str) -> bool:
     """Whether this string is one of this module's own notices."""
     return result.lstrip().startswith(REFUSAL_PREFIX)
@@ -241,3 +252,46 @@ class ToolCallConvergence:
             # the futility streak is over.  The counter measures a *streak*, not
             # lifetime volume -- lifetime volume is bounded by max_tool_rounds.
             self._unproductive.pop(name, None)
+
+
+    def stall_signals(self) -> tuple[str, ...]:
+        """S2/S3 signals currently active, in a deterministic order."""
+        signals: list[str] = []
+        if self._s3_no_novelty():
+            signals.append("S3")
+        if self._s2_cycle():
+            signals.append("S2")
+        return tuple(signals)
+
+    def should_checkpoint(self, signal: str) -> bool:
+        """Rate-limit checkpoints: each signal fires at most once per turn."""
+        if signal in self._injected:
+            return False
+        self._injected.add(signal)
+        return True
+
+    def _s3_no_novelty(self) -> bool:
+        """True when the last window rounds produced no new execution triple."""
+        if len(self._history) < self.s3_window_rounds:
+            return False
+        window = self._history[-self.s3_window_rounds:]
+        prior = set(self._history[:-self.s3_window_rounds])
+        return all(entry in prior for entry in window)
+
+    def _s2_cycle(self) -> bool:
+        """True when the recent trace repeats a length-L cycle K times unchanged."""
+        for length in range(2, self.s2_cycle_max_length + 1):
+            need = length * self.s2_cycle_min_repeats
+            if len(self._history) < need:
+                continue
+            tail = self._history[-need:]
+            pattern = tail[:length]
+            if len({name for name, _, _ in pattern}) <= 1:
+                continue
+            if all(
+                tail[rep * length:(rep + 1) * length] == pattern
+                for rep in range(self.s2_cycle_min_repeats)
+            ):
+                return True
+        return False
+

@@ -1762,9 +1762,15 @@ async def test_agent_length_truncation_persists_partial_and_resumes(tmp_path: Pa
         assert result is not None
         assert result.status is AgentRunStatus.COMPLETED
         assert result.model_turns == 2
-        assert any(
-            message.get("role") == "assistant" and message.get("reasoning") == "partial thinking"
+        truncated_rows = [
+            message
             for message in persisted
+            if message.get("role") == "assistant" and message.get("reasoning") == "partial thinking"
+        ]
+        assert truncated_rows, "the truncated round's reasoning must be persisted"
+        assert truncated_rows[0].get("content"), (
+            "a truncated row needs non-empty content: providers treat a reasoning-only "
+            "assistant message as non-existent and never read the reasoning back"
         )
     finally:
         await mock_server.cleanup()

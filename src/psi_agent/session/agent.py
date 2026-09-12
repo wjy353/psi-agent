@@ -51,6 +51,7 @@ from psi_agent.session.protocol import (
     DEFAULT_SOFT_TOOL_ROUNDS,
     SOFT_LIMIT_CHECKPOINT,
     STALL_CHECKPOINT,
+    LENGTH_TRUNCATION_PLACEHOLDER,
     MAX_CONSECUTIVE_LENGTH_TRUNCATIONS,
     MAX_ROUNDS_NOTICE,
     AgentChunk,
@@ -1059,6 +1060,12 @@ class SessionAgent:
                                 partial_msg["content"] = accumulated_content
                             if accumulated_reasoning:
                                 partial_msg["reasoning"] = accumulated_reasoning
+                            if accumulated_reasoning and not accumulated_content:
+                                # An assistant row with empty content is invisible to
+                                # providers even when it carries reasoning (measured:
+                                # GLM re-plans from scratch).  The placeholder keeps
+                                # this row -- and therefore the reasoning -- readable.
+                                partial_msg["content"] = LENGTH_TRUNCATION_PLACEHOLDER
                             produced_partial = bool(accumulated_content or accumulated_reasoning)
                             if produced_partial:
                                 self._conversation.add(with_kind(partial_msg, turn_response_kind))

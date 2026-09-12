@@ -65,11 +65,15 @@ def test_project_history_for_wire_keeps_reasoning_only_assistant_rows() -> None:
         ]
     )
 
-    assert projected == [
-        {"role": "user", "content": "confirm"},
-        {"role": "assistant", "content": "internal only", "reasoning_content": "internal only"},
-        {"role": "user", "content": "continue"},
-    ]
+    assert projected[0] == {"role": "user", "content": "confirm"}
+    assert projected[2] == {"role": "user", "content": "continue"}
+    folded = projected[1]
+    assert folded["role"] == "assistant"
+    assert folded["reasoning_content"] == "internal only"
+    # The reasoning is readable, but carries a provenance header so the model does
+    # not mistake internal thinking for something it said to the user.
+    assert folded["content"].endswith("internal only")
+    assert folded["content"].startswith("[")
 
 
 def test_project_history_for_wire_does_not_overwrite_real_content() -> None:

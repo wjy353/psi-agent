@@ -398,6 +398,18 @@ def _rename_reasoning_for_wire(projected: dict[str, Any]) -> None:
     projected["reasoning_content"] = value
 
 
+_TRUNCATED_REASONING_PREFIX = (
+    "[以下为我上一轮被输出长度上限截断的内部推理，不是面向用户的回复]\n"
+)
+"""Header put in front of a folded truncated reasoning.
+
+Without it the model reads the reasoning as something it *said to the user*, and
+then treats草稿/试探性结论 as established.  With it the text stays readable (which
+is the whole point of folding) while keeping its provenance: internal thinking,
+cut off, not a public statement.
+"""
+
+
 def _expose_reasoning_as_content(projected: dict[str, Any]) -> None:
     """Put a truncated round's reasoning where the provider will actually read it.
 
@@ -421,7 +433,7 @@ def _expose_reasoning_as_content(projected: dict[str, Any]) -> None:
         return
     reasoning = projected.get("reasoning_content")
     if isinstance(reasoning, str) and reasoning.strip():
-        projected["content"] = reasoning
+        projected["content"] = _TRUNCATED_REASONING_PREFIX + reasoning
 
 
 def _fold_turn_context(content: Any, turn_context: str) -> Any:

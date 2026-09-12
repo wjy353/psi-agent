@@ -20,6 +20,7 @@ from psi_agent.session.ai_client import AiClient
 from psi_agent.session.conversation import Conversation
 from psi_agent.session.protocol import (
     DEFAULT_MAX_TOOL_ROUNDS,
+    MAX_CONSECUTIVE_LENGTH_TRUNCATIONS,
     MAX_ROUNDS_NOTICE,
     AgentChunk,
     AgentError,
@@ -990,17 +991,20 @@ async def test_agent_empty_content_stop(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("finish_reason", ["stop", "length"])
 async def test_agent_reasoning_only_stop_does_not_persist_invalid_assistant(
     tmp_path: Path,
-    finish_reason: str,
 ) -> None:
-    """A zero-content final turn must not leave an invalid assistant row."""
+    """A zero-content ``stop`` turn must not leave an invalid assistant row.
+
+    ``length`` is deliberately not in this test any more: a truncated round is
+    resumable, and its reasoning-only row is persisted on purpose (see
+    ``test_agent_length_truncation_persists_partial_and_resumes``).
+    """
 
     async def handler(request: web.Request) -> web.StreamResponse:
         resp = web.StreamResponse(status=200, reason="OK", headers={"Content-Type": "text/event-stream"})
         await resp.prepare(request)
-        await resp.write(_sse_chunk(reasoning="internal only", finish=finish_reason).encode())
+        await resp.write(_sse_chunk(reasoning="internal only", finish="stop").encode())
         await resp.write(b"data: [DONE]\n\n")
         return resp
 
@@ -1703,15 +1707,133 @@ async def test_run_streamed_result_completed_on_model_stop(tmp_path: Path) -> No
 
 @pytest.mark.anyio
 async def test_run_streamed_result_incomplete_on_length(tmp_path: Path) -> None:
-    """A non-``stop`` model reason keeps its raw value and reads as incomplete."""
+    """``length`` resumes instead of dropping the round, bounded by the streak.
+
+    The canned body reports ``length`` on every round, so the turn must run the
+    consecutive streak to its ceiling and only then stop, keeping the partial
+    output.
+    """
     run = await _run_streamed_against(tmp_path, _sse_chunk(content="truncated", finish="length").encode())
 
     result = run.result
     assert result is not None
     assert result.status is AgentRunStatus.INCOMPLETE
-    assert result.stop_cause is AgentStopCause.MODEL_STOPPED
+    assert result.stop_cause is AgentStopCause.MODEL_TRUNCATED
     assert result.model_finish_reason == "length"
+    assert result.model_turns == MAX_CONSECUTIVE_LENGTH_TRUNCATIONS
     assert not result.is_complete
+
+
+@pytest.mark.anyio
+async def test_agent_length_truncation_persists_partial_and_resumes(tmp_path: Path) -> None:
+    """A truncated round keeps its partial output, and the next round runs.
+
+    Regression for the 0-char discard: a reasoning-only truncation used to be
+    dropped entirely, because the round ended before any content arrived.
+    """
+    calls = {"n": 0}
+
+    async def handler(request: web.Request) -> web.StreamResponse:
+        calls["n"] += 1
+        resp = web.StreamResponse(status=200, reason="OK", headers={"Content-Type": "text/event-stream"})
+        await resp.prepare(request)
+        if calls["n"] == 1:
+            await resp.write(_sse_chunk(reasoning="partial thinking", finish="length").encode())
+        else:
+            await resp.write(_sse_chunk(content="done", finish="stop").encode())
+        await resp.write(b"data: [DONE]\n\n")
+        return resp
+
+    mock_server = MockAIServer(tmp_path)
+    ai_socket = await mock_server.start(handler)
+    history_path = tmp_path / "histories" / "truncated.jsonl"
+    try:
+        agent = SessionAgent(
+            ai_client=AiClient(ai_socket),
+            tool_registry=ToolRegistry(),
+            conversation=Conversation(path=history_path),
+        )
+        run = agent.run_streamed({"role": "user", "content": "go"})
+        async for _ in run:
+            pass
+        persisted = await Conversation._load(history_path)
+
+        result = run.result
+        assert result is not None
+        assert result.status is AgentRunStatus.COMPLETED
+        assert result.model_turns == 2
+        assert any(
+            message.get("role") == "assistant" and message.get("reasoning") == "partial thinking"
+            for message in persisted
+        )
+    finally:
+        await mock_server.cleanup()
+
+
+@pytest.mark.anyio
+async def test_length_streak_resets_after_a_normal_round(tmp_path: Path) -> None:
+    """The ceiling counts *consecutive* truncations: a normal round resets it.
+
+    Round 1 truncates once; round 2 completes a tool round (streak resets);
+    rounds 3-5 must then be needed to reach the ceiling.  If the first
+    truncation were still counted, the turn would stop a round early.
+    """
+    tool_call_chunk = json.dumps(
+        {
+            "id": "mock",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "test",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "c1",
+                                "type": "function",
+                                "function": {"name": "noop", "arguments": "{}"},
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+        }
+    )
+    calls = {"n": 0}
+
+    async def handler(request: web.Request) -> web.StreamResponse:
+        calls["n"] += 1
+        resp = web.StreamResponse(status=200, reason="OK", headers={"Content-Type": "text/event-stream"})
+        await resp.prepare(request)
+        if calls["n"] == 2:
+            await resp.write(f"data: {tool_call_chunk}\n\n".encode())
+        else:
+            await resp.write(_sse_chunk(content=f"chunk{calls['n']}", finish="length").encode())
+        await resp.write(b"data: [DONE]\n\n")
+        return resp
+
+    mock_server = MockAIServer(tmp_path)
+    ai_socket = await mock_server.start(handler)
+    try:
+        agent = SessionAgent(
+            ai_client=AiClient(ai_socket),
+            tool_registry=ToolRegistry(),
+            conversation=Conversation(path=tmp_path / "streak.jsonl"),
+        )
+        run = agent.run_streamed({"role": "user", "content": "go"})
+        async for _ in run:
+            pass
+
+        result = run.result
+        assert result is not None
+        assert result.stop_cause is AgentStopCause.MODEL_TRUNCATED
+        # 1 truncation + 1 tool round + 3 truncations = 5 rounds
+        assert result.model_turns == 5
+    finally:
+        await mock_server.cleanup()
 
 
 @pytest.mark.anyio

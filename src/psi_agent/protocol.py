@@ -23,11 +23,14 @@ REASONING_KIND_THINKING = "thinking"
 REASONING_KIND_TOOL_CALL = "tool_call"
 REASONING_KIND_TOOL_RESULT = "tool_result"
 
-# ``stop`` / ``tool_calls`` are OpenAI standard.  ``error`` and
-# ``compaction_needed`` are psi-agent extensions used only between our own
-# layers -- never exposed to an external caller.
+# ``stop`` / ``tool_calls`` / ``length`` are OpenAI standard.  ``length`` means
+# the provider's output-token ceiling was hit -- the reply was *truncated*, not
+# finished.  Session treats it as a resumable state rather than an error.
+# ``error`` and ``compaction_needed`` are psi-agent extensions used only
+# between our own layers -- never exposed to an external caller.
 FINISH_REASON_STOP = "stop"
 FINISH_REASON_TOOL_CALLS = "tool_calls"
+FINISH_REASON_LENGTH = "length"
 FINISH_REASON_ERROR = "error"
 FINISH_REASON_COMPACTION_NEEDED = "compaction_needed"
 

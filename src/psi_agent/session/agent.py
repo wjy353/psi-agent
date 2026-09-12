@@ -25,6 +25,7 @@ from psi_agent._card_markers import (
 from psi_agent.protocol import (
     FINISH_REASON_COMPACTION_NEEDED,
     FINISH_REASON_ERROR,
+    FINISH_REASON_LENGTH,
     FINISH_REASON_STOP,
     FINISH_REASON_TOOL_CALLS,
     REASONING_KIND_THINKING,
@@ -50,6 +51,7 @@ from psi_agent.session.protocol import (
     DEFAULT_SOFT_TOOL_ROUNDS,
     SOFT_LIMIT_CHECKPOINT,
     STALL_CHECKPOINT,
+    MAX_CONSECUTIVE_LENGTH_TRUNCATIONS,
     MAX_ROUNDS_NOTICE,
     AgentChunk,
     AgentError,
@@ -776,6 +778,9 @@ class SessionAgent:
                     # never inherited by the next one (``tool_convergence``).
                     convergence = ToolCallConvergence()
                     pending_checkpoint: str | None = None
+                    # Consecutive ``length`` truncations in this turn.  Reset by
+                    # any other terminal round reason (see the length branch).
+                    consecutive_length_truncations = 0
                     for _round in range(self._max_tool_rounds):
                         logger.debug(f"Agent loop round {_round + 1}/{self._max_tool_rounds}")
                         model_turns = _round + 1
@@ -1029,6 +1034,49 @@ class SessionAgent:
                                     await self._conversation.commit()
 
                                     break
+
+                        if finish_reason is not None and finish_reason != FINISH_REASON_LENGTH:
+                            # Any other terminal reason means the previous round
+                            # finished normally, so the truncation streak is over.
+                            consecutive_length_truncations = 0
+
+                        if finish_reason == FINISH_REASON_LENGTH:
+                            # The provider cut this round off at its output-token
+                            # ceiling -- "the reply was truncated", not "the model
+                            # finished".  Keep whatever was produced (content and/or
+                            # reasoning) and let the next round continue, instead of
+                            # dropping a round that produced nothing but thinking.
+                            consecutive_length_truncations += 1
+                            logger.warning(
+                                f"Model output truncated (finish_reason='length') on round {model_turns}: "
+                                f"content={len(accumulated_content)} chars, "
+                                f"reasoning={len(accumulated_reasoning)} chars, "
+                                f"tool_calls={len(accumulated_tool_calls)}; "
+                                f"consecutive={consecutive_length_truncations}/{MAX_CONSECUTIVE_LENGTH_TRUNCATIONS}"
+                            )
+                            partial_msg: dict[str, Any] = {"role": "assistant"}
+                            if accumulated_content:
+                                partial_msg["content"] = accumulated_content
+                            if accumulated_reasoning:
+                                partial_msg["reasoning"] = accumulated_reasoning
+                            produced_partial = bool(accumulated_content or accumulated_reasoning)
+                            if produced_partial:
+                                self._conversation.add(with_kind(partial_msg, turn_response_kind))
+                                await self._conversation.commit()
+                            if (
+                                not produced_partial
+                                or consecutive_length_truncations >= MAX_CONSECUTIVE_LENGTH_TRUNCATIONS
+                            ):
+                                # Nothing to continue from, or the continuation
+                                # budget is spent: keep the partial output and stop.
+                                _finish(
+                                    AgentRunStatus.INCOMPLETE,
+                                    AgentStopCause.MODEL_TRUNCATED,
+                                    finish_reason,
+                                    model_turns,
+                                )
+                                return
+                            continue
 
                         if finish_reason == FINISH_REASON_STOP:
                             logger.debug("AI finished with stop")

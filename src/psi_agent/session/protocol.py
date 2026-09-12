@@ -16,6 +16,7 @@ from typing import Any
 from psi_agent.protocol import (
     FINISH_REASON_COMPACTION_NEEDED,
     FINISH_REASON_ERROR,
+    FINISH_REASON_LENGTH,
     FINISH_REASON_STOP,
     FINISH_REASON_TOOL_CALLS,
     REASONING_KIND_THINKING,
@@ -39,8 +40,10 @@ __all__ = [
     "SOFT_LIMIT_CHECKPOINT",
     "FINISH_REASON_COMPACTION_NEEDED",
     "FINISH_REASON_ERROR",
+    "FINISH_REASON_LENGTH",
     "FINISH_REASON_STOP",
     "FINISH_REASON_TOOL_CALLS",
+    "MAX_CONSECUTIVE_LENGTH_TRUNCATIONS",
     "MAX_ROUNDS_NOTICE",
     "REASONING_KIND_THINKING",
     "REASONING_KIND_TOOL_CALL",
@@ -78,6 +81,17 @@ still show measurable progress, not a license to repeat the same work.  Both
 limits count *model rounds* (one AI request per round, possibly several tool
 calls).  Single source of truth for ``Session``, ``SessionAgent.__init__`` and
 ``SessionAgent.create``.
+"""
+
+MAX_CONSECUTIVE_LENGTH_TRUNCATIONS = 3
+"""How many *consecutive* ``finish_reason="length"`` rounds a turn will resume.
+
+A truncation is resumable, so the loop saves the partial assistant output and
+issues the next round instead of dropping the round.  The streak is what is
+bounded, not lifetime volume: any terminal reason other than ``length`` resets
+it, so an isolated truncation that recovers costs nothing.  Three consecutive
+truncations means continuation is not making progress -- the turn stops and
+keeps whatever was produced.
 """
 
 S2_CYCLE_MIN_REPEATS = 3
@@ -180,7 +194,13 @@ class AgentStopCause(StrEnum):
     MODEL_COMPLETED = "model_completed"
     """Model finished on its own with ``stop``."""
     MODEL_STOPPED = "model_stopped"
-    """Model stopped for its own reason other than ``stop`` (e.g. ``length``)."""
+    """Model stopped for its own reason other than ``stop``, and the round was
+    not truncated (e.g. an unknown finish reason)."""
+    MODEL_TRUNCATED = "model_truncated"
+    """The reply was cut off by the provider's output-token ceiling
+    (``finish_reason="length"``) and the bounded continuation budget ran out.
+    Distinct from ``MODEL_STOPPED`` so triage can tell "the model chose to stop"
+    from "the provider cut it off"."""
     AGENT_TURN_LIMIT = "agent_turn_limit"
     """Agent loop hit ``max_tool_rounds``.  The limit counts *rounds*, and one
     round may carry several tool calls — hence "turn limit", not "tool limit"."""

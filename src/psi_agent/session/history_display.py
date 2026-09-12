@@ -317,11 +317,32 @@ def _append_for_ai(
     msg: dict[str, Any],
     role: str,
 ) -> None:
-    """Append one valid wire message, skipping unusable legacy assistant rows."""
+    """Append one valid wire message, skipping unusable legacy assistant rows.
+
+    A ``length``-truncated round can leave an assistant row carrying only
+    ``reasoning`` -- the model was cut off mid-thinking, before emitting any
+    content or tool calls.  Providers in interleaved-thinking mode require that
+    reasoning to be passed back, and ``_project_for_ai`` has already renamed it
+    to the provider-shaped ``reasoning_content``.  Such a row is valid wire
+    payload, so it must survive this filter.
+    """
     projected = _project_for_ai(msg, role)
-    if role == "assistant" and not projected.get("content") and not projected.get("tool_calls"):
+    if role == "assistant" and not _has_assistant_payload(projected):
         return
     out.append((projected, msg))
+
+
+def _has_assistant_payload(projected: dict[str, Any]) -> bool:
+    """Whether a projected assistant row carries anything a provider consumes.
+
+    ``content``, ``reasoning_content`` and ``tool_calls`` are three different
+    protocol meanings -- do not collapse them into one.  ``reasoning_content``
+    is the provider-shaped key that :func:`_rename_reasoning_for_wire` produced;
+    this checks the *projected* row, where the rename has already happened.
+    """
+    return bool(
+        projected.get("content") or projected.get("reasoning_content") or projected.get("tool_calls")
+    )
 
 
 def _project_for_ai(msg: dict[str, Any], role: str) -> dict[str, Any]:

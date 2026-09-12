@@ -48,15 +48,37 @@ def test_project_history_for_wire_rewrites_legacy_schedule_roles() -> None:
     assert not is_displayable_chat_message({"role": "user_schedule", "content": "heartbeat"})
 
 
-def test_project_history_for_wire_skips_reasoning_only_assistant_rows() -> None:
+def test_project_history_for_wire_keeps_reasoning_only_assistant_rows() -> None:
+    """A truncated round can leave a reasoning-only row; it must reach the wire.
+
+    Interleaved-thinking providers require the previous round's reasoning to be
+    passed back, so ``reasoning_content`` alone is valid assistant payload.
+    """
     projected = project_history_for_wire(
         [
             {"role": "user", "content": "confirm"},
             {"role": "assistant", "reasoning": "internal only", "kind": KIND_CHAT},
+            {"role": "user", "content": "continue"},
+        ]
+    )
+
+    assert projected == [
+        {"role": "user", "content": "confirm"},
+        {"role": "assistant", "reasoning_content": "internal only"},
+        {"role": "user", "content": "continue"},
+    ]
+
+
+def test_project_history_for_wire_still_skips_assistant_rows_with_no_payload() -> None:
+    """No content, no reasoning, no tool_calls -> still an invalid wire row."""
+    projected = project_history_for_wire(
+        [
+            {"role": "user", "content": "confirm"},
+            {"role": "assistant", "kind": KIND_CHAT},
             {
                 "role": "assistant",
                 "content": "",
-                "reasoning": "legacy internal only",
+                "reasoning": "",
                 "tool_calls": [],
                 "kind": KIND_CHAT,
             },

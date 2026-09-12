@@ -43,7 +43,6 @@ __all__ = [
     "FINISH_REASON_LENGTH",
     "FINISH_REASON_STOP",
     "FINISH_REASON_TOOL_CALLS",
-    "LENGTH_TRUNCATION_PLACEHOLDER",
     "MAX_CONSECUTIVE_LENGTH_TRUNCATIONS",
     "MAX_ROUNDS_NOTICE",
     "REASONING_KIND_THINKING",
@@ -82,20 +81,6 @@ still show measurable progress, not a license to repeat the same work.  Both
 limits count *model rounds* (one AI request per round, possibly several tool
 calls).  Single source of truth for ``Session``, ``SessionAgent.__init__`` and
 ``SessionAgent.create``.
-"""
-
-LENGTH_TRUNCATION_PLACEHOLDER = (
-    "[上一轮输出达到长度上限被截断；本轮的 reasoning_content 是已产生的推理内容]"
-)
-"""Non-empty ``content`` written alongside a truncated round's reasoning.
-
-Measured against the live provider endpoint: an assistant message with an empty
-``content`` and only ``reasoning_content`` is treated as **non-existent** -- the
-model re-plans the task from scratch instead of continuing (sentinel probe: it
-denied the reasoning content existed, twice).  Adding ``content`` + the same
-``reasoning_content`` made the model see and quote it.  So the placeholder is
-load-bearing, not cosmetic: without it the resumable-truncation path saves
-reasoning that the provider will never read.
 """
 
 MAX_CONSECUTIVE_LENGTH_TRUNCATIONS = 3

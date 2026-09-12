@@ -1768,10 +1768,10 @@ async def test_agent_length_truncation_persists_partial_and_resumes(tmp_path: Pa
             if message.get("role") == "assistant" and message.get("reasoning") == "partial thinking"
         ]
         assert truncated_rows, "the truncated round's reasoning must be persisted"
-        assert truncated_rows[0].get("content"), (
-            "a truncated row needs non-empty content: providers treat a reasoning-only "
-            "assistant message as non-existent and never read the reasoning back"
-        )
+        # Stored with an empty content on purpose: the projection layer folds the
+        # reasoning into `content` on the wire, because providers ignore a
+        # reasoning-only assistant row (measured).  Storage stays clean.
+        assert not truncated_rows[0].get("content")
     finally:
         await mock_server.cleanup()
 

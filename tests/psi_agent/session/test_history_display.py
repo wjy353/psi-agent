@@ -49,10 +49,13 @@ def test_project_history_for_wire_rewrites_legacy_schedule_roles() -> None:
 
 
 def test_project_history_for_wire_keeps_reasoning_only_assistant_rows() -> None:
-    """A truncated round can leave a reasoning-only row; it must reach the wire.
+    """A truncated round's reasoning-only row must reach the wire *and* be readable.
 
-    Interleaved-thinking providers require the previous round's reasoning to be
-    passed back, so ``reasoning_content`` alone is valid assistant payload.
+    Measured against the live endpoint: an assistant row whose content is empty is
+    invisible to the model even when it carries ``reasoning_content`` (sentinel
+    probe: denied outright), while the same text in ``content`` is quoted back.
+    So the projection folds the reasoning into ``content``; ``reasoning_content``
+    is kept as well for providers that do read it.
     """
     projected = project_history_for_wire(
         [
@@ -64,8 +67,20 @@ def test_project_history_for_wire_keeps_reasoning_only_assistant_rows() -> None:
 
     assert projected == [
         {"role": "user", "content": "confirm"},
-        {"role": "assistant", "reasoning_content": "internal only"},
+        {"role": "assistant", "content": "internal only", "reasoning_content": "internal only"},
         {"role": "user", "content": "continue"},
+    ]
+
+
+def test_project_history_for_wire_does_not_overwrite_real_content() -> None:
+    """A round with real content keeps it; the reasoning is not folded in."""
+    projected = project_history_for_wire(
+        [
+            {"role": "assistant", "content": "the answer", "reasoning": "internal only"},
+        ]
+    )
+    assert projected == [
+        {"role": "assistant", "content": "the answer", "reasoning_content": "internal only"},
     ]
 
 

@@ -351,6 +351,7 @@ def _project_for_ai(msg: dict[str, Any], role: str) -> dict[str, Any]:
     projected["role"] = role
     if role == "assistant":
         _rename_reasoning_for_wire(projected)
+        _expose_reasoning_as_content(projected)
     if role == "tool":
         # Second line of defence behind the write-site cap in ``agent.py``: rows
         # written before that cap existed are already on disk (one live session
@@ -395,6 +396,32 @@ def _rename_reasoning_for_wire(projected: dict[str, Any]) -> None:
     if isinstance(value, str) and not value.strip():
         return
     projected["reasoning_content"] = value
+
+
+def _expose_reasoning_as_content(projected: dict[str, Any]) -> None:
+    """Put a truncated round's reasoning where the provider will actually read it.
+
+    Measured against the live endpoint: an assistant message with an empty
+    ``content`` is invisible to the model even when it carries
+    ``reasoning_content`` -- a sentinel placed only in ``reasoning_content`` was
+    denied outright, while the *same text* placed in ``content`` was quoted back
+    verbatim.  A resumable-truncation row has no real content (the model was cut
+    off inside its thinking), so its reasoning is the only thing there is to
+    show.
+
+    Folded in here, at projection time, rather than at the storage site: the
+    stored row keeps its original shape, so history files and the display path
+    are unaffected -- only the wire copy changes.
+    """
+    if projected.get("content") or projected.get("tool_calls"):
+        # A real reply, or a tool-call turn: the model already has something
+        # concrete there, and folding reasoning into it would rewrite a row the
+        # provider does read.  Only the content-less, tool-call-less truncated
+        # row needs help.
+        return
+    reasoning = projected.get("reasoning_content")
+    if isinstance(reasoning, str) and reasoning.strip():
+        projected["content"] = reasoning
 
 
 def _fold_turn_context(content: Any, turn_context: str) -> Any:
